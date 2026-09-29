@@ -1,0 +1,11 @@
+# conda env create -f environment.yml
+name: winrunner
+# conda-forge only: Anaconda's default channels require accepting their Terms of Service.
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements.txt

@@ -1,0 +1,73 @@
+/* WinRunner control panel - motion and display effects */
+
+@keyframes blink { 0% { opacity: 1; } 100% { opacity: 0.25; } }
+@keyframes pulse { from { opacity: 0.55; } to { opacity: 1; } }
+@keyframes stripes { from { transform: translateX(-17px); } to { transform: translateX(0); } }
+@keyframes slide { 0% { transform: translateX(0); } 50% { transform: translateX(233%); } 100% { transform: translateX(0); } }
+@keyframes sweep { 0% { transform: translateX(-220px); } 25% { transform: translateX(110vw); } 100% { transform: translateX(110vw); } }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pop-in { from { opacity: 0; transform: scale(0.97) translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes page-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes toast-in { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: none; } }
+@keyframes toast-out { to { opacity: 0; transform: translateX(40px); } }
+@keyframes tok-flash { from { background: var(--acc); color: var(--acc-tx); } to { background: transparent; } }
+@keyframes row-flash { from { background: rgba(255, 255, 255, 0.14); } to { background: transparent; } }
+@keyframes chevrons { from { transform: translateX(-16px); } to { transform: translateX(0); } }
+@keyframes scan-roll { 0% { transform: translateY(-20vh); } 18% { transform: translateY(120vh); } 100% { transform: translateY(120vh); } }
+@keyframes glow-breathe { from { box-shadow: 0 0 0 var(--glow); } to { box-shadow: 0 0 12px var(--glow); } }
+@keyframes caret { 50% { opacity: 0; } }
+@keyframes boot-line { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
+@keyframes layer-fill { from { transform: scaleY(0.2); opacity: 0.3; } to { transform: none; opacity: 1; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.flash { animation: row-flash 1.2s ease-out; }
+.spin { animation: spin 1s linear infinite; }
+
+/* CRT overlay: scanlines, vignette and a slow refresh band */
+#crt { position: fixed; inset: 0; pointer-events: none; z-index: 2000; display: none; }
+:root[data-crt="on"] #crt { display: block; }
+#crt::before { content: ""; position: absolute; inset: 0;
+  background: repeating-linear-gradient(to bottom, rgba(0,0,0,var(--scan-alpha)) 0 1px, transparent 1px 3px); }
+#crt::after { content: ""; position: absolute; inset: 0;
+  background: radial-gradient(ellipse at center, transparent 62%, rgba(0,0,0,0.28) 100%); }
+#crt .band { position: absolute; left: 0; right: 0; height: 18vh; top: 0; will-change: transform;
+  background: linear-gradient(to bottom, transparent, rgba(255,255,255,0.025) 50%, transparent);
+  animation: scan-roll 14s linear infinite; display: none; }
+:root[data-anim="full"] #crt .band { display: block; }
+/* nothing animates while the window is hidden or minimised */
+:root.hidden-window *, :root.hidden-window *::before, :root.hidden-window *::after { animation-play-state: paused !important; }
+
+/* glow off */
+:root[data-glow="off"] { --glow: transparent; }
+:root[data-glow="off"] .brand .mark { filter: none; }
+
+/* motion levels */
+:root[data-anim="reduced"] *, :root[data-anim="reduced"] *::before, :root[data-anim="reduced"] *::after {
+  animation-duration: 0.001s !important; animation-iteration-count: 1 !important; transition-duration: 0.001s !important; }
+:root[data-anim="reduced"] .led.blink, :root[data-anim="reduced"] .led.pulse { animation: none !important; }
+:root[data-anim="off"] *, :root[data-anim="off"] *::before, :root[data-anim="off"] *::after {
+  animation: none !important; transition: none !important; }
+@media (prefers-reduced-motion: reduce) {
+  :root:not([data-anim="full"]) * { animation-duration: 0.001s !important; transition-duration: 0.001s !important; }
+}
+
+/* boot screen */
+#boot { position: fixed; inset: 0; z-index: 1500; background: var(--bg-0); display: grid; place-items: center;
+  transition: opacity 400ms ease-in, visibility 400ms; }
+#boot.done { opacity: 0; visibility: hidden; }
+#boot .box { width: min(560px, calc(100vw - 40px)); }
+#boot .logo { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+#boot .logo svg { width: 64px; height: 64px; filter: drop-shadow(0 0 10px var(--glow)); }
+#boot .logo .name { font-family: Verdana, Tahoma, sans-serif; font-weight: bold; font-size: 30px; letter-spacing: 0.3em; }
+#boot .logo .name b { color: var(--acc); }
+#boot .logo .tag { font-size: 11px; letter-spacing: 0.34em; color: var(--tx-2); text-transform: uppercase; margin-top: 4px; }
+#boot .lines { font-family: var(--font-mono); font-size: 12px; min-height: 150px; color: var(--tx-1); }
+#boot .lines div { animation: boot-line 180ms ease-out both; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#boot .lines .ok { color: var(--ok); } #boot .lines .warn { color: var(--warn); }
+#boot .lines .cur::after { content: "_"; animation: caret 0.8s steps(1) infinite; }
+#boot .progress { margin-top: 12px; }
+#boot .skip { margin-top: 10px; font-size: 10px; color: var(--tx-2); letter-spacing: 0.1em; text-transform: uppercase; }
+
+/* connection lost overlay */
+#offline { position: fixed; left: 50%; top: 70px; transform: translateX(-50%); z-index: 800; padding: 8px 14px;
+  background: var(--err); color: #fff; font-weight: bold; letter-spacing: 0.08em; box-shadow: 3px 3px 0 rgba(0,0,0,0.4); }

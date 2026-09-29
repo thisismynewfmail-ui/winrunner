@@ -1,0 +1,11 @@
+# WinRunner runtime dependencies (Python 3.11)
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29
+httpx>=0.27
+pydantic>=2.6,<3
+psutil>=5.9
+pillow>=10.2
+jinja2>=3.1
+# Native application window (Microsoft Edge WebView2). Optional: without it the
+# control panel opens in the default browser.
+pywebview>=5.1; sys_platform == "win32"
