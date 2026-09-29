@@ -703,6 +703,30 @@ def gpu_driver_versions() -> dict[str, str]:
     return out
 
 
+def tdr_settings() -> dict[str, int]:
+    """Effective GPU Timeout Detection and Recovery settings (seconds; Windows defaults when unset).
+
+    Windows resets a GPU whose job runs longer than ``TdrDelay``; every Vulkan / D3D
+    device on it is then lost. ``TdrLevel`` 0 disables the detection.
+    """
+    out = {"level": 3, "delay_s": 2, "ddi_delay_s": 5, "configured": 0}
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers") as k:
+            for name, key in (("TdrLevel", "level"), ("TdrDelay", "delay_s"), ("TdrDdiDelay", "ddi_delay_s")):
+                try:
+                    value, kind = winreg.QueryValueEx(k, name)
+                except OSError:
+                    continue
+                if kind in (winreg.REG_DWORD, winreg.REG_QWORD) and isinstance(value, int):
+                    out[key] = value
+                    out["configured"] = 1
+    except OSError:
+        pass
+    return out
+
+
 _WEBVIEW2_CLIENT = r"Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 
 

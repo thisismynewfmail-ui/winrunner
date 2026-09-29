@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import aclosing
 from typing import Any, AsyncIterator
 
 import httpx
@@ -20,6 +21,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .context import AppContext
 from .events import RequestRecord
+from .faults import gpu_fault
 from .instance import EngineInstance
 from .manager import ModelError
 from .util import is_loopback
@@ -30,6 +32,12 @@ log = logging.getLogger("winrunner.api")
 LMS_STOP_REASONS = {"stop": "eosFound", "length": "maxPredictedTokensReached", "tool_calls": "toolCalls"}
 STRIP_FIELDS = ("ttl", "draft_model")
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
+# A request whose engine failed (GPU lost / crash) before any output reached the client is run again, once,
+# on the restarted engine.
+MAX_ENGINE_RETRIES = 1
+# After a broken connection: how long a crashing engine may take to exit (Windows Error Reporting can hold a
+# crashed process for a few seconds).
+ENGINE_EXIT_WAIT_S = 10.0
 
 
 def oai_error(status: int, message: str, code: str | None = None, etype: str | None = None) -> JSONResponse:
@@ -72,7 +80,11 @@ class SSEParser:
 
 
 def parse_event(raw: bytes) -> tuple[str | None, str | None]:
-    """(event name, data) of one SSE event; data None for comments."""
+    """(event name, data) of one SSE event; data None for comments.
+
+    llama-server reports errors inside a stream as ``data: {"error": ...}`` or, in some
+    builds, as a non-standard ``error: {...}`` line; the latter is returned as event "error".
+    """
     name = None
     data_lines = []
     for line in raw.split(b"\n"):
@@ -80,7 +92,25 @@ def parse_event(raw: bytes) -> tuple[str | None, str | None]:
             data_lines.append(line[5:].lstrip(b" ").decode("utf-8", errors="replace"))
         elif line.startswith(b"event:"):
             name = line[6:].strip().decode("utf-8", errors="replace")
+        elif line.startswith(b"error:"):
+            name = "error"
+            data_lines.append(line[6:].lstrip(b" ").decode("utf-8", errors="replace"))
     return name, ("\n".join(data_lines) if data_lines else None)
+
+
+def _is_data(event: bytes) -> bool:
+    """True for SSE events that carry data (as opposed to comments / keep-alives)."""
+    return parse_event(event)[1] is not None
+
+
+async def _events(resp: httpx.Response) -> AsyncIterator[bytes]:
+    """SSE events of an upstream streaming response."""
+    parser = SSEParser()
+    async for chunk in resp.aiter_raw():
+        for ev in parser.feed(chunk):
+            yield ev
+    for ev in parser.flush():
+        yield ev
 
 
 class ChatTap:
@@ -124,8 +154,8 @@ class ChatTap:
         if not isinstance(obj, dict):
             return raw
         modified = False
-        if "error" in obj and not obj.get("choices"):
-            self.error = obj["error"]
+        if name == "error" or ("error" in obj and not obj.get("choices")):
+            self.error = obj.get("error", obj)
             return raw
         for k in ("id", "created", "model", "system_fingerprint", "object"):
             if k in obj and k not in self.meta:
@@ -509,60 +539,88 @@ class OpenAIRouter:
                 media_type="text/event-stream", headers=SSE_HEADERS)
 
         # non-streaming
-        try:
-            inst = ready or await self._instance(requested, rec)
-            b = await upstream_body(inst)
-        except ModelError as exc:
-            ctx.tracker.finish(rec, error=str(exc))
-            return oai_error(exc.status, str(exc), exc.code)
-        rec.instance = inst.id
-        rec.model = inst.model_id
-        inst.active_requests += 1
-        inst.last_used = time.time()
-        try:
-            if aggregate:
-                tap = ChatTap(ctx, rec, False, True, None, kind)
-                result = await _until_disconnect(request, self._consume(inst, path, b, tap))
-                if result is None:
-                    ctx.tracker.finish(rec, cancelled=True)
-                    return Response(status_code=499)
-                status, err_body = result
-                if status != 200:
-                    ctx.tracker.finish(rec, error=_err_text(err_body))
-                    return Response(err_body, status_code=status, media_type="application/json")
-                if tap.error:
-                    ctx.tracker.finish(rec, error=_err_text(tap.error))
-                    return JSONResponse({"error": tap.error}, status_code=_err_status(tap.error))
-                out = tap.aggregate()
-                if lms:
-                    out.update(lms_stats(lms_context(inst), rec, tap.finish_reason, tap.timings))
-                ctx.tracker.finish(rec, tap.finish_reason, tap.timings, tap.usage)
-                inst.requests_served += 1
-                return JSONResponse(out)
-            result = await _until_disconnect(request, inst.client.post(path, json=b))  # type: ignore[union-attr]
-            if result is None:
-                ctx.tracker.finish(rec, cancelled=True)
-                return Response(status_code=499)
-            r: httpx.Response = result
-            if r.status_code != 200:
-                ctx.tracker.finish(rec, error=_err_text(r.content))
-                return Response(r.content, status_code=r.status_code, media_type="application/json")
-            data = r.json()
-            ch = (data.get("choices") or [{}])[0]
-            text = (ch.get("message") or {}).get("content") or ch.get("text") or ""
-            if text:
-                ctx.tracker.tokens(rec, text, "c")
-            if lms:
-                data.update(lms_stats(lms_context(inst), rec, ch.get("finish_reason", ""), data.get("timings")))
-            ctx.tracker.finish(rec, ch.get("finish_reason", ""), data.get("timings"), data.get("usage"))
-            inst.requests_served += 1
-            return JSONResponse(data)
-        except httpx.HTTPError as exc:
-            ctx.tracker.finish(rec, error=f"engine connection error: {exc}")
-            return oai_error(502, f"Engine connection error: {exc}", "engine_unavailable")
-        finally:
-            inst.active_requests -= 1
+        inst: EngineInstance | None = ready
+        target = requested
+        retries = 0
+        while True:
+            try:
+                if inst is None:
+                    if retries:  # waiting for the restarted engine: give up if the client leaves
+                        inst = await _until_disconnect(request, self._instance(target, rec))
+                        if inst is None:
+                            ctx.tracker.finish(rec, cancelled=True)
+                            return Response(status_code=499)
+                    else:
+                        inst = await self._instance(target, rec)
+                b = await upstream_body(inst)
+            except ModelError as exc:
+                ctx.tracker.finish(rec, error=str(exc))
+                return oai_error(exc.status, str(exc), exc.code)
+            rec.instance = inst.id
+            rec.model = inst.model_id
+            inst.active_requests += 1
             inst.last_used = time.time()
+            failure = ""  # the engine failed and is being restarted: run the request again
+            try:
+                if aggregate:
+                    tap = ChatTap(ctx, rec, False, True, None, kind)
+                    result = await _until_disconnect(request, self._consume(inst, path, b, tap))
+                    if result is None:
+                        ctx.tracker.finish(rec, cancelled=True)
+                        return Response(status_code=499)
+                    status, err_body = result
+                    err = err_body if status != 200 else tap.error
+                    if err is None:
+                        out = tap.aggregate()
+                        if lms:
+                            out.update(lms_stats(lms_context(inst), rec, tap.finish_reason, tap.timings))
+                        ctx.tracker.finish(rec, tap.finish_reason, tap.timings, tap.usage)
+                        inst.requests_served += 1
+                        return JSONResponse(out)
+                    if self._payload_fault(inst, err) and retries < MAX_ENGINE_RETRIES:
+                        failure = _err_text(err)
+                    elif status != 200:
+                        ctx.tracker.finish(rec, error=_err_text(err_body))
+                        return Response(err_body, status_code=status, media_type="application/json")
+                    else:
+                        ctx.tracker.finish(rec, error=_err_text(tap.error))
+                        return JSONResponse({"error": tap.error}, status_code=_err_status(tap.error))
+                else:
+                    result = await _until_disconnect(request, inst.client.post(path, json=b))  # type: ignore[union-attr]
+                    if result is None:
+                        ctx.tracker.finish(rec, cancelled=True)
+                        return Response(status_code=499)
+                    r: httpx.Response = result
+                    if r.status_code == 200:
+                        data = r.json()
+                        ch = (data.get("choices") or [{}])[0]
+                        text = (ch.get("message") or {}).get("content") or ch.get("text") or ""
+                        if text:
+                            ctx.tracker.tokens(rec, text, "c")
+                        if lms:
+                            data.update(lms_stats(lms_context(inst), rec, ch.get("finish_reason", ""),
+                                                  data.get("timings")))
+                        ctx.tracker.finish(rec, ch.get("finish_reason", ""), data.get("timings"), data.get("usage"))
+                        inst.requests_served += 1
+                        return JSONResponse(data)
+                    if self._payload_fault(inst, r.content) and retries < MAX_ENGINE_RETRIES:
+                        failure = _err_text(r.content)
+                    else:
+                        ctx.tracker.finish(rec, error=_err_text(r.content))
+                        return Response(r.content, status_code=r.status_code, media_type="application/json")
+            except httpx.HTTPError as exc:
+                if retries < MAX_ENGINE_RETRIES and await self._connection_fault(inst):
+                    failure = f"engine connection lost: {_exc_text(exc)}"
+                else:
+                    ctx.tracker.finish(rec, error=f"engine connection error: {_exc_text(exc)}")
+                    return oai_error(502, f"Engine connection error: {_exc_text(exc)}", "engine_unavailable")
+            finally:
+                inst.active_requests -= 1
+                inst.last_used = time.time()
+            retries += 1
+            target = inst.model_id
+            ctx.tracker.restart(rec, failure)
+            inst = None
 
     async def _consume(self, inst: EngineInstance, path: str, body: dict[str, Any],
                        tap: ChatTap) -> tuple[int, bytes]:
@@ -570,12 +628,9 @@ class OpenAIRouter:
         async with inst.client.stream("POST", path, json=body) as resp:
             if resp.status_code != 200:
                 return resp.status_code, await resp.aread()
-            parser = SSEParser()
-            async for chunk in resp.aiter_raw():
-                for ev in parser.feed(chunk):
+            async with aclosing(_events(resp)) as events:
+                async for ev in events:
                     tap.process(ev)
-            for ev in parser.flush():
-                tap.process(ev)
         return 200, b""
 
     async def _stream(self, request: Request, rec: RequestRecord, path: str, kind: str, lms: bool,
@@ -583,44 +638,71 @@ class OpenAIRouter:
                       ready: EngineInstance | None) -> AsyncIterator[bytes]:
         ctx = self.ctx
         inst: EngineInstance | None = ready
-        counted = False
+        target = requested
         tap: ChatTap | None = None
+        sent = False  # data events reached the client: the request can no longer be run again
+        retries = 0
         try:
-            if inst is None:
-                async for item in self._acquire(requested, rec):
-                    if isinstance(item, EngineInstance):
-                        inst = item
+            while True:
+                if inst is None:
+                    async for item in self._acquire(target, rec):
+                        if isinstance(item, EngineInstance):
+                            inst = item
+                        else:
+                            yield item
+                assert inst is not None
+                b = await upstream_body(inst)
+                rec.instance, rec.model = inst.id, inst.model_id
+                tap = ChatTap(ctx, rec, client_progress, client_usage, lms_context(inst) if lms else None, kind)
+                failure = ""  # the engine failed and is being restarted: run the request again
+                inst.active_requests += 1
+                inst.last_used = time.time()
+                try:
+                    assert inst.client is not None
+                    async with inst.client.stream("POST", path, json=b) as resp:
+                        if resp.status_code != 200:
+                            err = await resp.aread()
+                            if self._payload_fault(inst, err) and not sent and retries < MAX_ENGINE_RETRIES:
+                                failure = _err_text(err)
+                            else:
+                                ctx.tracker.finish(rec, error=_err_text(err))
+                                yield b"data: " + _error_payload(err, resp.status_code) + b"\n\n"
+                                return
+                        else:
+                            async with aclosing(_events(resp)) as events:
+                                async for ev in events:
+                                    had_error = tap.error is not None
+                                    out = tap.process(ev)
+                                    if tap.error is not None and not had_error:
+                                        if self._payload_fault(inst, tap.error) and not sent \
+                                                and retries < MAX_ENGINE_RETRIES:
+                                            failure = _err_text(tap.error)
+                                            break  # the error is not forwarded: the request runs again
+                                    if out is not None:
+                                        yield out + b"\n\n"
+                                        sent = sent or _is_data(out)
+                    if not failure:
+                        if tap.error:
+                            ctx.tracker.finish(rec, error=_err_text(tap.error))
+                        else:
+                            ctx.tracker.finish(rec, tap.finish_reason, tap.timings, tap.usage)
+                            inst.requests_served += 1
+                        return
+                except httpx.HTTPError as exc:
+                    if not sent and retries < MAX_ENGINE_RETRIES and await self._connection_fault(inst):
+                        failure = f"engine connection lost: {_exc_text(exc)}"
                     else:
-                        yield item
-            assert inst is not None
-            b = await upstream_body(inst)
-            rec.instance, rec.model = inst.id, inst.model_id
-            inst.active_requests += 1
-            inst.last_used = time.time()
-            counted = True
-            tap = ChatTap(ctx, rec, client_progress, client_usage, lms_context(inst) if lms else None, kind)
-            assert inst.client is not None
-            async with inst.client.stream("POST", path, json=b) as resp:
-                if resp.status_code != 200:
-                    err = await resp.aread()
-                    ctx.tracker.finish(rec, error=_err_text(err))
-                    yield b"data: " + _error_payload(err, resp.status_code) + b"\n\n"
-                    return
-                parser = SSEParser()
-                async for chunk in resp.aiter_raw():
-                    for ev in parser.feed(chunk):
-                        out = tap.process(ev)
-                        if out is not None:
-                            yield out + b"\n\n"
-                for ev in parser.flush():
-                    out = tap.process(ev)
-                    if out is not None:
-                        yield out + b"\n\n"
-            if tap.error:
-                ctx.tracker.finish(rec, error=_err_text(tap.error))
-            else:
-                ctx.tracker.finish(rec, tap.finish_reason, tap.timings, tap.usage)
-                inst.requests_served += 1
+                        ctx.tracker.finish(rec, error=f"engine connection error: {_exc_text(exc)}")
+                        yield b"data: " + _dumps({"error": {"message": f"Engine connection error: {_exc_text(exc)}",
+                                                             "type": "server_error"}}) + b"\n\n"
+                        return
+                finally:
+                    inst.active_requests -= 1
+                    inst.last_used = time.time()
+                retries += 1
+                target = inst.model_id
+                ctx.tracker.restart(rec, failure)
+                inst = None
         except ModelError as exc:
             ctx.tracker.finish(rec, error=str(exc))
             yield b"data: " + _dumps({"error": {"message": str(exc), "type": "invalid_request_error",
@@ -629,19 +711,31 @@ class OpenAIRouter:
             ctx.tracker.finish(rec, error=str(exc))
             yield b"data: " + _dumps({"error": {"message": str(exc), "type": "invalid_request_error",
                                                  "code": "invalid_image"}}) + b"\n\n"
-        except httpx.HTTPError as exc:
-            ctx.tracker.finish(rec, error=f"engine connection error: {exc}")
-            yield b"data: " + _dumps({"error": {"message": f"Engine connection error: {exc}",
-                                                 "type": "server_error"}}) + b"\n\n"
         except (asyncio.CancelledError, GeneratorExit):
             if rec.t_end is None:
                 ctx.tracker.finish(rec, tap.finish_reason if tap else "", tap.timings if tap else None,
                                    cancelled=True)
             raise
-        finally:
-            if counted and inst is not None:
-                inst.active_requests -= 1
-                inst.last_used = time.time()
+
+    # ----- engine failures ---------------------------------------------------------------------
+
+    def _payload_fault(self, inst: EngineInstance, err: Any) -> bool:
+        """Inspect an engine error response; on an unrecoverable GPU error the engine is restarted.
+
+        Returns True when a replacement engine is being started for the model (the request
+        may then be run again on it).
+        """
+        text = _err_text(err)
+        what = gpu_fault(text)
+        if what is None:
+            return False
+        return self.ctx.manager.report_fault(inst, f"{what}: {text}")
+
+    async def _connection_fault(self, inst: EngineInstance) -> bool:
+        """The connection to the engine broke: True when the engine crashed and is being restarted."""
+        if not await inst.wait_exited(ENGINE_EXIT_WAIT_S):
+            return False  # still running: not a crash
+        return inst.recovering
 
     # ----- other endpoints (pass-through with telemetry) ---------------------------------------
 
@@ -685,83 +779,154 @@ class OpenAIRouter:
             return oai_error(exc.status, str(exc), exc.code)
         for k in STRIP_FIELDS:
             body.pop(k, None)
-        body["model"] = inst.model_id
-        rec.instance, rec.model = inst.id, inst.model_id
-        assert inst.client is not None
 
         if stream and kind in ("responses", "anthropic"):
-            async def gen() -> AsyncIterator[bytes]:
-                inst.active_requests += 1
+            return StreamingResponse(self._passthrough_stream(rec, path, kind, body, inst),
+                                     media_type="text/event-stream", headers=SSE_HEADERS)
+
+        retries = 0
+        while True:
+            body["model"] = inst.model_id
+            rec.instance, rec.model = inst.id, inst.model_id
+            assert inst.client is not None
+            inst.active_requests += 1
+            failure = ""  # the engine failed and is being restarted: run the request again
+            try:
+                result = await _until_disconnect(request, inst.client.post(path, json=body))
+                if result is None:
+                    ctx.tracker.finish(rec, cancelled=True)
+                    return Response(status_code=499)
+                r: httpx.Response = result
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                    except ValueError:
+                        data = {}
+                    ctx.tracker.finish(rec, "stop", usage=_norm_usage(data.get("usage") or {})
+                                       if isinstance(data, dict) else None)
+                    inst.requests_served += 1
+                    return Response(r.content, status_code=r.status_code,
+                                    media_type=r.headers.get("content-type", "application/json"))
+                if self._payload_fault(inst, r.content) and retries < MAX_ENGINE_RETRIES:
+                    failure = _err_text(r.content)
+                else:
+                    ctx.tracker.finish(rec, error=_err_text(r.content))
+                    return Response(r.content, status_code=r.status_code,
+                                    media_type=r.headers.get("content-type", "application/json"))
+            except httpx.HTTPError as exc:
+                if retries < MAX_ENGINE_RETRIES and await self._connection_fault(inst):
+                    failure = f"engine connection lost: {_exc_text(exc)}"
+                else:
+                    ctx.tracker.finish(rec, error=f"engine connection error: {_exc_text(exc)}")
+                    return oai_error(502, f"Engine connection error: {_exc_text(exc)}", "engine_unavailable")
+            finally:
+                inst.active_requests -= 1
+                inst.last_used = time.time()
+            retries += 1
+            ctx.tracker.restart(rec, failure)
+            try:
+                nxt = await _until_disconnect(request, self._instance(inst.model_id, rec))
+            except ModelError as exc:
+                ctx.tracker.finish(rec, error=str(exc))
+                return oai_error(exc.status, str(exc), exc.code)
+            if nxt is None:
+                ctx.tracker.finish(rec, cancelled=True)
+                return Response(status_code=499)
+            inst = nxt
+
+    async def _passthrough_stream(self, rec: RequestRecord, path: str, kind: str, body: dict[str, Any],
+                                  first: EngineInstance) -> AsyncIterator[bytes]:
+        ctx = self.ctx
+        inst: EngineInstance | None = first
+        target = first.model_id
+        sent = False  # data events reached the client: the request can no longer be run again
+        retries = 0
+        try:
+            while True:
+                if inst is None:
+                    async for item in self._acquire(target, rec):
+                        if isinstance(item, EngineInstance):
+                            inst = item
+                        else:
+                            yield item
+                assert inst is not None and inst.client is not None
+                body["model"] = inst.model_id
+                rec.instance, rec.model = inst.id, inst.model_id
                 usage: dict[str, Any] = {}
                 finish = ""
+                error: Any = None
+                failure = ""  # the engine failed and is being restarted: run the request again
+                inst.active_requests += 1
                 try:
-                    async with inst.client.stream("POST", path, json=body) as resp:  # type: ignore[union-attr]
+                    async with inst.client.stream("POST", path, json=body) as resp:
                         if resp.status_code != 200:
                             err = await resp.aread()
-                            ctx.tracker.finish(rec, error=_err_text(err))
-                            yield b"data: " + _error_payload(err, resp.status_code) + b"\n\n"
-                            return
-                        parser = SSEParser()
-                        async for chunk in resp.aiter_raw():
-                            for ev in parser.feed(chunk):
-                                u, f = _tap_named_event(ctx, rec, ev, kind)
-                                usage.update(u)
-                                finish = f or finish
-                                yield ev + b"\n\n"
-                        for ev in parser.flush():
-                            yield ev + b"\n\n"
-                    ctx.tracker.finish(rec, finish, usage=_norm_usage(usage))
-                    inst.requests_served += 1
-                except (asyncio.CancelledError, GeneratorExit):
-                    if rec.t_end is None:
-                        ctx.tracker.finish(rec, cancelled=True)
-                    raise
+                            if self._payload_fault(inst, err) and not sent and retries < MAX_ENGINE_RETRIES:
+                                failure = _err_text(err)
+                            else:
+                                ctx.tracker.finish(rec, error=_err_text(err))
+                                yield b"data: " + _error_payload(err, resp.status_code) + b"\n\n"
+                                return
+                        else:
+                            async with aclosing(_events(resp)) as events:
+                                async for ev in events:
+                                    u, f, e = _tap_named_event(ctx, rec, ev, kind)
+                                    usage.update(u)
+                                    finish = f or finish
+                                    if e is not None and error is None:
+                                        error = e
+                                        if self._payload_fault(inst, e) and not sent \
+                                                and retries < MAX_ENGINE_RETRIES:
+                                            failure = _err_text(e)
+                                            break  # the error is not forwarded: the request runs again
+                                    yield ev + b"\n\n"
+                                    sent = sent or _is_data(ev)
+                    if not failure:
+                        if error is not None:
+                            ctx.tracker.finish(rec, error=_err_text(error))
+                        else:
+                            ctx.tracker.finish(rec, finish, usage=_norm_usage(usage))
+                            inst.requests_served += 1
+                        return
                 except httpx.HTTPError as exc:
-                    ctx.tracker.finish(rec, error=str(exc))
+                    if not sent and retries < MAX_ENGINE_RETRIES and await self._connection_fault(inst):
+                        failure = f"engine connection lost: {_exc_text(exc)}"
+                    else:
+                        ctx.tracker.finish(rec, error=f"engine connection error: {_exc_text(exc)}")
+                        return
                 finally:
                     inst.active_requests -= 1
                     inst.last_used = time.time()
-
-            return StreamingResponse(gen(), media_type="text/event-stream", headers=SSE_HEADERS)
-
-        inst.active_requests += 1
-        try:
-            result = await _until_disconnect(request, inst.client.post(path, json=body))
-            if result is None:
-                ctx.tracker.finish(rec, cancelled=True)
-                return Response(status_code=499)
-            r: httpx.Response = result
-            if r.status_code != 200:
-                ctx.tracker.finish(rec, error=_err_text(r.content))
-            else:
-                try:
-                    data = r.json()
-                except ValueError:
-                    data = {}
-                ctx.tracker.finish(rec, "stop", usage=_norm_usage(data.get("usage") or {}) if isinstance(data, dict)
-                                   else None)
-                inst.requests_served += 1
-            return Response(r.content, status_code=r.status_code,
-                            media_type=r.headers.get("content-type", "application/json"))
-        except httpx.HTTPError as exc:
+                retries += 1
+                target = inst.model_id
+                ctx.tracker.restart(rec, failure)
+                inst = None
+        except ModelError as exc:
             ctx.tracker.finish(rec, error=str(exc))
-            return oai_error(502, f"Engine connection error: {exc}", "engine_unavailable")
-        finally:
-            inst.active_requests -= 1
-            inst.last_used = time.time()
+            yield b"data: " + _dumps({"error": {"message": str(exc), "type": "server_error",
+                                                 "code": exc.code}}) + b"\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            if rec.t_end is None:
+                ctx.tracker.finish(rec, cancelled=True)
+            raise
 
 
-def _tap_named_event(ctx: AppContext, rec: RequestRecord, raw: bytes, kind: str) -> tuple[dict, str]:
+def _tap_named_event(ctx: AppContext, rec: RequestRecord, raw: bytes, kind: str) -> tuple[dict, str, Any]:
+    """Telemetry from one Responses / Anthropic stream event: (usage, finish reason, error or None)."""
     name, data = parse_event(raw)
     if not data:
-        return {}, ""
+        return {}, "", None
     try:
         obj = json.loads(data)
     except ValueError:
-        return {}, ""
+        return {}, "", None
     if not isinstance(obj, dict):
-        return {}, ""
+        return {}, "", None
     t = obj.get("type") or name or ""
+    if name == "error" or t == "error" or (not obj.get("type") and obj.get("error")):
+        return {}, "", obj.get("error") or obj
+    if t == "response.failed":
+        return {}, "", (obj.get("response") or {}).get("error") or obj
     usage: dict[str, Any] = {}
     finish = ""
     if kind == "responses":
@@ -791,7 +956,7 @@ def _tap_named_event(ctx: AppContext, rec: RequestRecord, raw: bytes, kind: str)
     if "prompt_progress" in obj:
         pp = obj["prompt_progress"]
         ctx.tracker.progress(rec, int(pp.get("total", 0)), int(pp.get("processed", 0)), int(pp.get("cache", 0)))
-    return usage, finish
+    return usage, finish, None
 
 
 def _norm_usage(u: dict[str, Any]) -> dict[str, Any]:
@@ -803,6 +968,11 @@ def _norm_usage(u: dict[str, Any]) -> dict[str, Any]:
     if ct is not None:
         out["completion_tokens"] = ct
     return out
+
+
+def _exc_text(exc: BaseException) -> str:
+    """Message of an exception; httpx errors are often empty (e.g. a connection reset by a crashed engine)."""
+    return str(exc) or exc.__class__.__name__
 
 
 def _err_text(err: Any) -> str:

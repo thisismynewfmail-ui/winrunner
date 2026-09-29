@@ -115,6 +115,7 @@ class RequestRecord:
     tool_calls: list[str] = field(default_factory=list)
     preview: str = ""
     params: dict[str, Any] = field(default_factory=dict)
+    retries: int = 0  # times the request was run again after an engine failure
 
     def snapshot(self) -> dict[str, Any]:
         d = asdict(self)
@@ -202,6 +203,23 @@ class RequestTracker:
             r.preview += text
         with self._lock:
             self._pending.setdefault(r.id, []).append([text, kind])
+
+    def restart(self, r: RequestRecord, reason: str) -> None:
+        """A request is run again after an engine failure: discard its partial progress."""
+        with self._lock:
+            self._pending.pop(r.id, None)
+        self._last_progress_emit.pop(r.id, None)
+        r.retries += 1
+        r.phase = "loading_model"
+        r.prompt_total = None
+        r.prompt_processed = r.prompt_cached = 0
+        r.tokens = r.reasoning_tokens = 0
+        r.t_prompt_start = r.t_first_token = None
+        r.preview = ""
+        r.tool_calls = []
+        self.bus.publish("request", record=r.snapshot())
+        self.bus.activity_log(f"{r.id} runs again once the engine has been restarted ({reason[:160]})", level="warn",
+                              category="request", rid=r.id)
 
     def finish(self, r: RequestRecord, finish_reason: str = "", timings: dict[str, Any] | None = None,
                usage: dict[str, Any] | None = None, error: str = "", cancelled: bool = False) -> None:

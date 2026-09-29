@@ -154,12 +154,25 @@ class HardwareMonitor:
             "gpus": [
                 {k: v for k, v in asdict(g).items() if k not in ("sysfs",)} for g in self.gpus
             ],
+            "gpu_timeout": self.gpu_timeout(),
             "telemetry": {
                 "pdh": bool(self._pdh and getattr(self._pdh, "ok", False)),
                 "adl": bool(self._adl and getattr(self._adl, "ok", False)),
                 "sysfs": any(g.sysfs for g in self.gpus),
             },
         }
+
+    @staticmethod
+    def gpu_timeout() -> dict[str, int] | None:
+        """Windows GPU timeout (TDR) settings; None on platforms without one."""
+        fn = getattr(_plat, "tdr_settings", None)
+        if fn is None:
+            return None
+        try:
+            return fn()
+        except Exception:
+            log.debug("TDR settings unavailable", exc_info=True)
+            return None
 
     # ----- engine device mapping ---------------------------------------------
 

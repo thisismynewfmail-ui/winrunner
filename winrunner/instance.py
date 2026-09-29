@@ -18,6 +18,7 @@ import psutil
 from .cmdline import LaunchSpec
 from .engine import EngineInfo
 from .events import EventBus
+from .faults import describe_exit_code
 from .library import ModelEntry
 from .logparse import LogParser
 from .paths import IS_WINDOWS
@@ -81,6 +82,7 @@ class EngineInstance:
         expected_load_s: float,
         device_map: dict[str, str],
         on_exit: Callable[["EngineInstance", int], None] | None = None,
+        on_fault: Callable[["EngineInstance", str], bool] | None = None,
     ):
         self.id = new_id("inst-", 3)
         self.entry = entry
@@ -97,6 +99,7 @@ class EngineInstance:
         self.expected_load_s = expected_load_s
         self.device_map = device_map
         self.on_exit = on_exit
+        self.on_fault = on_fault
         self.base_url = f"http://127.0.0.1:{port}"
         self.state = "starting"
         self.phase = "spawn"
@@ -107,6 +110,10 @@ class EngineInstance:
         self.t_tensors: float | None = None
         self.proc: subprocess.Popen | None = None
         self.pid: int | None = None
+        self.exit_code: int | None = None
+        self._exited = asyncio.Event()
+        # Set by the model manager when this engine failed while serving and a replacement is started.
+        self.recovery: asyncio.Future | None = None
         self.log: deque[dict[str, Any]] = deque(maxlen=6000)
         self._parser = LogParser(jsonl="--log-jsonl" in spec.args)
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -147,7 +154,7 @@ class EngineInstance:
         try:
             self.proc = subprocess.Popen(args, **kwargs)
         except OSError as exc:
-            self._fail(f"could not start engine: {exc}")
+            self.fail(f"could not start engine: {exc}")
             raise RuntimeError(self.error) from exc
         self.pid = self.proc.pid
         if IS_WINDOWS:  # pragma: no cover
@@ -183,9 +190,10 @@ class EngineInstance:
                 await asyncio.sleep(0.3)  # let the reader thread flush the final log lines
                 errs = self.load_info["errors"][-3:]
                 detail = "; ".join(errs) if errs else "see engine log"
-                self._fail(f"engine exited during load (code {self.proc.returncode}): {detail}")
+                self.fail(f"engine exited during load ({describe_exit_code(self.proc.returncode)}): {detail}")
                 raise RuntimeError(self.error)
             if self.state == "error":
+                await self.stop()
                 raise RuntimeError(self.error)
             try:
                 r = await self.client.get("/health", timeout=2.0)
@@ -194,7 +202,7 @@ class EngineInstance:
             except httpx.HTTPError:
                 pass
             if time.monotonic() > deadline:
-                self._fail(f"engine did not become ready within {int(timeout)} s")
+                self.fail(f"engine did not become ready within {int(timeout)} s")
                 await self.stop()
                 raise RuntimeError(self.error)
             await asyncio.sleep(0.25)
@@ -209,6 +217,9 @@ class EngineInstance:
                 self.props = r.json()
         except (httpx.HTTPError, ValueError):
             pass
+        if self.state == "error":  # the engine failed while its properties were read
+            await self.stop()
+            raise RuntimeError(self.error)
         gguf_tmpl = self.entry.info.chat_template or ""
         eng_tmpl = self.props.get("chat_template") or ""
         if self.params.chat_template_mode == "gguf" and gguf_tmpl and eng_tmpl:
@@ -272,13 +283,37 @@ class EngineInstance:
     def _on_exit(self, rc: int) -> None:
         for ll in self._parser.flush():
             self._handle(ll.level, ll.text, ll.events)
+        self.exit_code = rc
         was = self.state
-        self._log_line("info" if was == "stopping" else "error", f"engine process exited with code {rc}",
-                       source="winrunner")
+        self._log_line("info" if was == "stopping" else "error",
+                       f"engine process exited ({describe_exit_code(rc)})", source="winrunner")
         if was == "ready":
-            self._fail(f"engine process exited unexpectedly (code {rc})")
+            self.fail(f"engine process exited unexpectedly ({describe_exit_code(rc)})")
             if self.on_exit:
                 self.on_exit(self, rc)
+        self._exited.set()
+
+    async def wait_exited(self, timeout: float) -> bool:
+        """Wait until the engine process has exited and its exit was handled; False on timeout."""
+        if self.proc is None:
+            return False
+        try:
+            await asyncio.wait_for(self._exited.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def report_fault(self, reason: str) -> bool:
+        """The engine reported an unrecoverable GPU error. True if a replacement engine is being started."""
+        if self.on_fault is None:
+            return False
+        return self.on_fault(self, reason)
+
+    @property
+    def recovering(self) -> bool:
+        """This engine failed and a replacement is being started (or was started successfully)."""
+        f = self.recovery
+        return f is not None and (not f.done() or (not f.cancelled() and f.exception() is None))
 
     def _on_line(self, line: str) -> None:
         for ll in self._parser.feed(line):
@@ -337,6 +372,12 @@ class EngineInstance:
                 li["errors"].append(d["message"])
                 if self.state == "loading":
                     self.bus.activity_log(f"{self.model_id}: {d['message'][:200]}", level="error", category="engine")
+            elif kind == "gpu_fault":
+                if self.state == "ready":
+                    self.report_fault(f"{d['what']}: {d['message'][:300]}")
+                elif self.state in ("starting", "loading"):
+                    # the engine could come up "ready" with a GPU it can never use again
+                    self.fail(f"{d['what']} while loading: {d['message'][:300]}")
             elif kind.startswith("task_"):
                 self.bus.publish("task", iid=self.id, kind=kind, **d)
 
@@ -396,7 +437,8 @@ class EngineInstance:
             return bool(mods.get("vision"))
         return bool(self.mmproj and self.entry.has_vision)
 
-    def _fail(self, msg: str) -> None:
+    def fail(self, msg: str) -> None:
+        """Take the instance out of service: requests are no longer routed to it."""
         self.error = msg
         self.state = "error"
         self._emit_state()
@@ -446,6 +488,8 @@ class EngineInstance:
             "last_used": self.last_used,
             "device_map": self.device_map,
             "restarts": self.restarts,
+            "recovering": self.state == "error" and self.recovery is not None and not self.recovery.done(),
+            "exit_code": self.exit_code,
             "generation_defaults": {
                 k: v for k, v in ((self.props.get("default_generation_settings") or {}).get("params") or {}).items()
                 if k in ("temperature", "top_k", "top_p", "min_p", "repeat_penalty", "repeat_last_n",

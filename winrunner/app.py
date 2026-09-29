@@ -22,6 +22,7 @@ from .context import AppContext
 from .downloads import DownloadManager
 from .engine import EngineManager
 from .events import BusLogHandler, EventBus, RequestTracker
+from .faults import TDR_MIN_DELAY_S, TDR_SCRIPT, tdr_limited
 from .hardware import HardwareMonitor
 from .library import ModelLibrary
 from .manager import ModelManager
@@ -120,6 +121,14 @@ def recommendations(sysinfo: dict[str, Any]) -> list[dict[str, str]]:
                     "text": f"{ram / GiB:.0f} GiB RAM: large mixture-of-experts models that exceed VRAM keep expert "
                             "weights in system RAM automatically while attention and KV cache stay on the GPUs. "
                             "The prompt cache (8 GiB default) keeps recent conversations for instant reuse."})
+    tdr = sysinfo.get("gpu_timeout")
+    if gpus and tdr_limited(tdr):
+        out.append({"title": "GPU timeout (TDR)",
+                    "text": f"Windows resets a GPU when one GPU job runs longer than {tdr['delay_s']} s (TdrDelay). "
+                            "Long prompts on large models, or models partly kept in system RAM, can exceed this; "
+                            "the engine then loses the GPU (\"ErrorDeviceLost\") and WinRunner has to restart it. "
+                            f"Run {TDR_SCRIPT} as administrator to raise the limit (to 60 s; at least "
+                            f"{TDR_MIN_DELAY_S} s is recommended), then restart Windows."})
     total_vram = sum(g.get("vram_total") or 0 for g in gpus)
     if total_vram:
         out.append({"title": "Context length and KV cache",

@@ -9,13 +9,15 @@ import logging
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .cmdline import build_fit_args, build_server_args
 from .config import LoadParams, SettingsStore
 from .engine import EngineDevice, EngineInfo, EngineManager
 from .events import EventBus, RequestTracker
+from .faults import GPU_DEVICE_LOST, gpu_fault, tdr_hint, tdr_limited
 from .hardware import HardwareMonitor
 from .instance import EngineInstance
 from .library import ModelEntry, ModelLibrary
@@ -27,12 +29,34 @@ log = logging.getLogger("winrunner.manager")
 
 _CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
+# Automatic recovery of an engine that crashed or lost its GPU while serving.
+RECOVERY_LIMIT = 3  # automatic restarts of one model ...
+RECOVERY_WINDOW_S = 600.0  # ... within this period; after that the model is unloaded until requested again
+RECOVERY_DELAYS_S = (3.0, 10.0, 30.0)  # pause before each reload attempt (driver reset, memory release)
+DEVICE_WAIT_S = 90.0  # longest wait for the GPUs to become usable again after a reset
+DEVICE_POLL_S = 2.0
+DEVICE_SETTLE_MIB = 256  # free VRAM counts as settled when it grows less than this between two polls
+
+SOURCE_LABELS = {"jit": "JIT request", "ui": "control panel", "startup": "startup", "recovery": "automatic restart"}
+_RECOVERY_ABORTS = ("shutting_down", "model_replaced")  # reasons to stop a recovery at once (no retries)
+
 
 class ModelError(Exception):
     def __init__(self, message: str, status: int = 400, code: str = "model_error"):
         super().__init__(message)
         self.status = status
         self.code = code
+
+
+@dataclass
+class _Recovery:
+    """Replacement of a failed engine instance by a new engine process."""
+
+    old: EngineInstance
+    reason: str
+    future: asyncio.Future
+    task: asyncio.Task | None = None
+    loading: bool = False  # the replacement engine is being started (no longer cancellable)
 
 
 class ModelManager:
@@ -50,7 +74,10 @@ class ModelManager:
         self._pending: dict[str, asyncio.Future] = {}
         self._engine: EngineInfo | None = None
         self._tasks: list[asyncio.Task] = []
-        self._restart_log: list[float] = []
+        self._recoveries: dict[str, _Recovery] = {}  # model id -> running recovery
+        self._recovery_log: dict[str, list[float]] = {}  # model id -> times of automatic restarts
+        self._background: set[asyncio.Task] = set()
+        self._tdr_hint_shown = False
         self._plan_cache: dict[str, tuple[float, dict]] = {}
         self._shutting_down = False
         self.exiting: Any = lambda: False  # set by the entry point: True once the server is stopping
@@ -90,6 +117,9 @@ class ModelManager:
         self._shutting_down = True
         for t in self._tasks:
             t.cancel()
+        for r in list(self._recoveries.values()):
+            if r.task is not None and not r.loading:
+                r.task.cancel()
         await asyncio.gather(*(i.stop(timeout=6) for i in list(self.instances.values())), return_exceptions=True)
         self.instances.clear()
 
@@ -330,8 +360,11 @@ class ModelManager:
         finally:
             self._pending.pop(entry.id, None)
 
-    async def _load_locked(self, entry: ModelEntry, overrides: dict | None, source: str) -> EngineInstance:
+    async def _load_locked(self, entry: ModelEntry, overrides: dict | None, source: str,
+                           guard: Callable[[], None] | None = None) -> EngineInstance:
         async with self._load_lock:
+            if guard is not None:
+                guard()  # may raise: conditions can change while waiting for the lock
             eng = await self.engine_async()
             if eng is None:
                 raise ModelError("No llama.cpp engine installed. Open Settings > Engine to download one.", 503,
@@ -346,7 +379,7 @@ class ModelManager:
             for inst in self._evict_set(entry.id):
                 await self._drain(inst)
                 await self._unload(inst, reason=f"evicted for {entry.id}")
-            self.bus.activity_log(f"Loading {entry.id} ({'JIT request' if source == 'jit' else 'control panel'})",
+            self.bus.activity_log(f"Loading {entry.id} ({SOURCE_LABELS.get(source, source)})",
                                   category="model", model=entry.id)
             self.bus.publish("load_stage", model=entry.id, stage="planning", label="Planning memory layout")
             pl, extra = await self.plan(entry.id, overrides, verify=True, assume_evict=False)
@@ -359,6 +392,8 @@ class ModelManager:
                 self.bus.activity_log(
                     f"Engine projection: {'full GPU offload' if pl.full_offload else 'partial offload'}, "
                     f"KV {pl.kv_k.upper()}, context {pl.ctx:,}", category="model")
+            if self._shutting_down:  # planning can take a while; never start an engine during shutdown
+                raise ModelError("WinRunner is shutting down", 503, "shutting_down")
             port = free_port()
             api_key = new_id("", 16)
             spec = build_server_args(
@@ -371,7 +406,7 @@ class ModelManager:
                 entry=entry, params=p, plan=pl, engine=eng, spec=spec, port=port, api_key=api_key, bus=self.bus,
                 mmproj=mmproj, priority=self.store.settings.engine.process_priority,
                 expected_load_s=prof.last_load_seconds, device_map=self.device_map(devices),
-                on_exit=self._on_instance_exit,
+                on_exit=self._on_instance_exit, on_fault=self.report_fault,
             )
             self.instances[inst.id] = inst
             try:
@@ -395,6 +430,11 @@ class ModelManager:
             return inst
 
     async def unload(self, key: str) -> bool:
+        rec = self._recoveries.get(key) or next((r for r in self._recoveries.values() if r.old.id == key), None)
+        if rec is not None and rec.task is not None and not rec.loading:
+            rec.task.cancel()  # unloaded while waiting to be restarted
+            await asyncio.wait({rec.task})
+            return True
         inst = self.instances.get(key) or self.instance_for_model(key)
         if not inst:
             return False
@@ -410,31 +450,199 @@ class ModelManager:
         self.instances.pop(inst.id, None)
         self.bus.publish("instance_removed", iid=inst.id, model=inst.model_id)
 
+    def _spawn(self, coro) -> asyncio.Task:
+        """Start a background task and keep a reference to it until it is done."""
+        task = asyncio.get_running_loop().create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return task
+
+    def _drop(self, inst: EngineInstance) -> None:
+        """Forget a stopped instance."""
+        if self.instances.get(inst.id) is inst:
+            del self.instances[inst.id]
+            self.bus.publish("instance_removed", iid=inst.id, model=inst.model_id)
+
+    # ----- automatic recovery ------------------------------------------------------------------
+
     def _on_instance_exit(self, inst: EngineInstance, rc: int) -> None:
-        if self._shutting_down or self.exiting():
-            return
-        now = time.time()
-        self._restart_log = [t for t in self._restart_log if now - t < 600]
+        """The engine process of a ready instance exited on its own (crash / abort)."""
+        reason = inst.error or "engine process exited unexpectedly"
+        # A lost GPU often ends in an abort; the engine's last words say so (debug records are skipped: they
+        # can quote prompts).
+        last_words = [r["text"] for r in list(inst.log)[-30:] if r["level"] != "debug"]
+        what = next(filter(None, map(gpu_fault, reversed(last_words))), None)
+        self._begin_recovery(inst, f"{what}: {reason}" if what else reason)
+
+    def report_fault(self, inst: EngineInstance, reason: str) -> bool:
+        """An engine reported an unrecoverable GPU error (e.g. Vulkan device lost).
+
+        The engine process usually keeps running, but it can never use the lost GPU
+        again: every further request would fail (or crash it). It is replaced by a new
+        engine process. Returns True when a replacement is being started, so callers
+        can wait for it and retry.
+        """
+        if inst.recovery is None and inst.state == "ready":
+            inst.fail(f"{reason} (the engine cannot use the GPU any more)")
+            self._begin_recovery(inst, reason)
+        return inst.recovering
+
+    def _begin_recovery(self, inst: EngineInstance, reason: str) -> None:
+        if inst.recovery is not None or self.instances.get(inst.id) is not inst:
+            return  # already handled (several requests can fail at once) or already unloaded
+        model_id = inst.model_id
         if inst.pid:
             self.monitor.unwatch_process(inst.pid)
-        if len(self._restart_log) >= 3:
-            self.bus.activity_log(f"{inst.model_id} crashed repeatedly; automatic restart disabled", level="error",
-                                  category="model")
+        if self._shutting_down or self.exiting():
+            self._spawn(self._retire(inst))
             return
-        self._restart_log.append(now)
+        if reason.startswith(GPU_DEVICE_LOST) and not self._tdr_hint_shown:
+            tdr = self.monitor.gpu_timeout()
+            if tdr_limited(tdr):
+                self._tdr_hint_shown = True
+                self.bus.activity_log(tdr_hint(tdr), level="warn", category="hardware")
+        pending = self._pending.get(model_id)
+        if pending is not None:
+            # a load of this model is already queued (reload from the control panel): it replaces the engine
+            inst.recovery = pending
+            self._spawn(self._retire(inst))
+            return
+        now = time.time()
+        recent = [t for t in self._recovery_log.get(model_id, []) if now - t < RECOVERY_WINDOW_S]
+        if len(recent) >= RECOVERY_LIMIT:
+            self._recovery_log[model_id] = recent
+            self.bus.activity_log(
+                f"{model_id} failed {len(recent) + 1} times within {RECOVERY_WINDOW_S / 60:.0f} minutes; automatic "
+                "restart is disabled and the model was unloaded. It loads again with the next request that names it "
+                "(just-in-time loading) or from the Library.", level="error", category="model", model=model_id)
+            self._spawn(self._retire(inst))
+            return
+        recent.append(now)
+        self._recovery_log[model_id] = recent
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        inst.recovery = fut
+        self._pending[model_id] = fut  # requests for this model wait for the replacement instead of failing
+        rec = _Recovery(old=inst, reason=reason, future=fut)
+        self._recoveries[model_id] = rec
+        self.bus.activity_log(f"Restarting {model_id} (automatic recovery {len(recent)} of {RECOVERY_LIMIT} "
+                              f"within {RECOVERY_WINDOW_S / 60:.0f} min)", level="warn", category="model",
+                              model=model_id)
+        rec.task = self._spawn(self._recover(rec))
 
-        async def restart() -> None:
-            self.instances.pop(inst.id, None)
-            self.bus.publish("instance_removed", iid=inst.id, model=inst.model_id)
-            self.bus.activity_log(f"Restarting {inst.model_id} after engine exit (code {rc})", level="warn",
-                                  category="model")
-            try:
-                new = await self.load(inst.model_id, overrides=inst.params.model_dump(mode="json"), source="recovery")
-                new.restarts = inst.restarts + 1
-            except Exception as exc:
-                log.error("restart failed: %s", exc)
+    async def _retire(self, inst: EngineInstance) -> None:
+        """Stop a failed engine without replacing it."""
+        try:
+            await inst.stop(timeout=5)
+        finally:
+            self._drop(inst)
 
-        asyncio.get_running_loop().create_task(restart())
+    async def _recover(self, rec: _Recovery) -> None:
+        old = rec.old
+        model_id = old.model_id
+        overrides = old.params.model_dump(mode="json")
+        used = [d.name for d in old.plan.devices]
+        try:
+            # Kill the failed engine first: it holds VRAM and the lost GPU context.
+            await old.stop(timeout=5)
+            last: Exception | None = None
+            for attempt, delay in enumerate(RECOVERY_DELAYS_S, 1):
+                await asyncio.sleep(delay)  # let the driver finish resetting the GPU
+                self._check_recovery(model_id)
+                await self._wait_for_devices(used)
+                self._check_recovery(model_id)
+                entry = self.library.get(model_id) or self.library.resolve(model_id)
+                if entry is None:
+                    raise ModelError(f"model '{model_id}' is no longer in the library", 404, "model_not_found")
+                rec.loading = True
+                self._drop(old)
+                try:
+                    new = await self._load_locked(entry, overrides, "recovery",
+                                                  guard=lambda: self._check_recovery(model_id))
+                except Exception as exc:
+                    if isinstance(exc, ModelError) and exc.code in _RECOVERY_ABORTS:
+                        raise
+                    last = exc
+                    rec.loading = False
+                    if attempt < len(RECOVERY_DELAYS_S):
+                        self.bus.activity_log(
+                            f"{model_id}: restart attempt {attempt} failed ({exc}); trying again in "
+                            f"{RECOVERY_DELAYS_S[attempt]:.0f} s", level="warn", category="model", model=model_id)
+                    continue
+                new.restarts = old.restarts + 1
+                self.bus.activity_log(f"{model_id} recovered from: {rec.reason}", level="ok", category="model",
+                                      model=model_id)
+                rec.future.set_result(new)
+                return
+            assert last is not None
+            raise last
+        except asyncio.CancelledError:
+            self._end_recovery(rec, ModelError(f"automatic restart of {model_id} was cancelled", 503,
+                                               "model_unavailable"))
+            self.bus.activity_log(f"Automatic restart of {model_id} cancelled", category="model", model=model_id)
+            raise
+        except Exception as exc:
+            err = exc if isinstance(exc, ModelError) else ModelError(str(exc), 503, "model_unavailable")
+            self._end_recovery(rec, err)
+            if err.code in _RECOVERY_ABORTS:
+                self.bus.activity_log(f"{model_id} was not restarted: {exc}", category="model", model=model_id)
+            else:
+                log.error("automatic restart of %s failed: %s", model_id, exc)
+                self.bus.activity_log(f"{model_id}: automatic restart failed: {exc}. Load it again from the "
+                                      "Library, or send a request that names it (just-in-time loading).",
+                                      level="error", category="model", model=model_id)
+        finally:
+            if self._pending.get(model_id) is rec.future:
+                del self._pending[model_id]
+            if self._recoveries.get(model_id) is rec:
+                del self._recoveries[model_id]
+
+    def _end_recovery(self, rec: _Recovery, err: ModelError) -> None:
+        if not rec.future.done():
+            rec.future.set_exception(err)
+            rec.future.exception()  # mark retrieved: nobody may be waiting
+        self._drop(rec.old)
+
+    def _check_recovery(self, model_id: str) -> None:
+        """Raise when the model should no longer be restarted automatically."""
+        if self._shutting_down or self.exiting():
+            raise ModelError("WinRunner is shutting down", 503, "shutting_down")
+        if self.store.settings.server.auto_evict:
+            other = next((i.model_id for i in self.instances.values()
+                          if i.model_id != model_id and i.state in ("ready", "loading", "starting")), None)
+            other = other or next((m for m in self._pending if m != model_id), None)
+            if other:
+                raise ModelError(f"{other} has been loaded in the meantime", 409, "model_replaced")
+
+    async def _wait_for_devices(self, names: list[str]) -> None:
+        """Wait until the engine sees the GPUs again and their free memory has settled.
+
+        After a GPU reset the driver needs a moment before the devices can be used again, and the
+        memory of the killed engine can be released with a delay: loading too early fails, or
+        places fewer layers on the GPUs than before.
+        """
+        if not names or await self.engine_async() is None:
+            return
+        deadline = time.monotonic() + DEVICE_WAIT_S
+        prev: dict[str, int] | None = None
+        announced = False
+        while True:
+            devs, _ = await self.devices(max_age=0)
+            free = {d.name: d.free_mib for d in devs}
+            missing = [n for n in names if n not in free]
+            if not missing:
+                if prev is not None and all(free[n] - prev.get(n, 0) < DEVICE_SETTLE_MIB for n in names):
+                    return
+                prev = free
+            elif not announced:
+                announced = True
+                self.bus.activity_log(f"Waiting for {', '.join(missing)} to become available again", level="warn",
+                                      category="hardware")
+            if time.monotonic() >= deadline:
+                if missing:
+                    self.bus.activity_log(f"{', '.join(missing)} still not available; trying to load anyway",
+                                          level="warn", category="hardware")
+                return
+            await asyncio.sleep(DEVICE_POLL_S)
 
     # ----- request routing ---------------------------------------------------------------
 
@@ -462,6 +670,8 @@ class ModelManager:
             return ready[0]
         if loading:
             return await self._await_ready(loading[0])
+        if self._pending:  # e.g. the active model is being restarted after an engine failure
+            return await self._await_ready(await asyncio.shield(next(iter(self._pending.values()))))
         last = self.store.settings.startup.last_model
         if jit and last and self.library.get(last) and not requested:
             return await self.load(last, source="jit")

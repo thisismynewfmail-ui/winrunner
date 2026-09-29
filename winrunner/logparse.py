@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .faults import gpu_fault
 from .util import strip_ansi
 
 _TEXT_PREFIX = re.compile(r"^(\d+\.\d+\.\d+\.\d+)\s+([IWEDTN])\s(.*)$")
@@ -188,7 +189,9 @@ class LogParser:
                 return [self._finish_multiline()]
             return []
         level = "error" if raw.lower().startswith(("error", "terminate called")) else "info"
-        return [self._parse_message(level, raw)]
+        # Unprefixed lines are continuations or plain prints, whose text may come from prompts; only the C++
+        # runtime's uncaught-exception report counts as an engine error record.
+        return [self._parse_message(level, raw, tagged=raw.startswith("terminate called"))]
 
     def flush(self) -> list[LogLine]:
         return [self._finish_multiline()] if self._multiline is not None else []
@@ -198,7 +201,8 @@ class LogParser:
         self._multiline = None
         return self._parse_message(self._multiline_level, text)
 
-    def _parse_message(self, level: str, msg: str) -> LogLine:
+    def _parse_message(self, level: str, msg: str, tagged: bool = True) -> LogLine:
+        """``tagged``: the level comes from the engine's own log record (JSONL level or text prefix)."""
         ll = LogLine(level=level, text=msg)
         if "example_format: '" in msg:
             ex = msg.split("example_format: '", 1)[1]
@@ -206,6 +210,11 @@ class LogParser:
                 ex = ex[:-1]
             ll.events.append(("template", {"example": ex}))
             return ll
+        if level == "error" and tagged:
+            # Error records are written by the engine itself (prompts are only ever logged at debug level).
+            what = gpu_fault(msg)
+            if what:
+                ll.events.append(("gpu_fault", {"what": what, "message": msg.strip()}))
         sm = _SLOT.search(msg)
         if sm:
             slot, task, rest = int(sm.group(1)), int(sm.group(2)), sm.group(3)
