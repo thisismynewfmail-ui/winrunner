@@ -77,6 +77,7 @@ class ModelManager:
         self._recoveries: dict[str, _Recovery] = {}  # model id -> running recovery
         self._recovery_log: dict[str, list[float]] = {}  # model id -> times of automatic restarts
         self._background: set[asyncio.Task] = set()
+        self._substitutes: set[tuple[str, str]] = set()  # (requested name, model answering) already reported
         self._tdr_hint_shown = False
         self._plan_cache: dict[str, tuple[float, dict]] = {}
         self._shutting_down = False
@@ -647,7 +648,12 @@ class ModelManager:
     # ----- request routing ---------------------------------------------------------------
 
     async def instance_for_request(self, requested: str | None, jit: bool) -> EngineInstance:
-        """Return a ready instance for a client-requested model name (JIT-loading if enabled)."""
+        """Return a ready instance for a client-requested model name (JIT-loading if enabled).
+
+        A name that is not in the library (clients often send fixed names such as "gpt-4o"), no
+        name, or - with just-in-time loading off - a library model that is not loaded, is answered
+        by the active model instead of failing (see :meth:`_substitute`).
+        """
         entry = self.library.resolve(requested) if requested else None
         if entry is not None:
             inst = self.instance_for_model(entry.id)
@@ -657,28 +663,21 @@ class ModelManager:
                 return await self._await_ready(await asyncio.shield(self._pending[entry.id]))
             if jit:
                 return await self.load(entry.id, source="jit")
-            ready = self.ready_instances()
-            if ready:
-                raise ModelError(
-                    f"Model '{requested}' is not loaded and just-in-time loading is disabled. "
-                    f"Loaded: {', '.join(i.model_id for i in ready)}", 404, "model_not_loaded")
-            raise ModelError("No model is loaded and just-in-time loading is disabled.", 503, "no_model_loaded")
-        # Unknown / empty model name: be lenient like most local servers and use the active model.
+        active = self._active()
+        if active is not None:
+            self._note_substitute(requested, active)
+            return active
         loading = [i for i in self.instances.values() if i.state in ("loading", "starting")]
-        ready = sorted(self.ready_instances(), key=lambda i: i.last_used, reverse=True)
-        if ready:
-            return ready[0]
         if loading:
-            return await self._await_ready(loading[0])
-        if self._pending:  # e.g. the active model is being restarted after an engine failure
-            return await self._await_ready(await asyncio.shield(next(iter(self._pending.values()))))
-        last = self.store.settings.startup.last_model
-        if jit and last and self.library.get(last) and not requested:
-            return await self.load(last, source="jit")
-        known = ", ".join(e.id for e in self.library.entries()[:20])
-        if requested:
-            raise ModelError(f"Model '{requested}' not found. Available: {known}", 404, "model_not_found")
-        raise ModelError("No model is loaded. Load a model in WinRunner or specify 'model'.", 503, "no_model_loaded")
+            inst = await self._await_ready(loading[0])
+        elif self._pending:  # e.g. the active model is being restarted after an engine failure
+            inst = await self._await_ready(await asyncio.shield(next(iter(self._pending.values()))))
+        elif jit and (default := self._default_model()):
+            inst = await self.load(default, source="jit")
+        else:
+            raise self._no_model_error(jit)
+        self._note_substitute(requested, inst)
+        return inst
 
     def ready_for(self, requested: str | None, jit: bool) -> EngineInstance | None:
         """Non-blocking variant of :meth:`instance_for_request`.
@@ -693,24 +692,68 @@ class ModelManager:
                 return inst
             if inst is not None or entry.id in self._pending or jit:
                 return None
-            ready = self.ready_instances()
-            if ready:
-                raise ModelError(
-                    f"Model '{requested}' is not loaded and just-in-time loading is disabled. "
-                    f"Loaded: {', '.join(i.model_id for i in ready)}", 404, "model_not_loaded")
-            raise ModelError("No model is loaded and just-in-time loading is disabled.", 503, "no_model_loaded")
-        ready = sorted(self.ready_instances(), key=lambda i: i.last_used, reverse=True)
-        if ready:
-            return ready[0]
+        active = self._active()
+        if active is not None:
+            self._note_substitute(requested, active)
+            return active
         if any(i.state in ("loading", "starting") for i in self.instances.values()) or self._pending:
             return None
-        last = self.store.settings.startup.last_model
-        if jit and last and self.library.get(last) and not requested:
+        if jit and self._default_model():
             return None
-        known = ", ".join(e.id for e in self.library.entries()[:20])
-        if requested:
-            raise ModelError(f"Model '{requested}' not found. Available: {known}", 404, "model_not_found")
-        raise ModelError("No model is loaded. Load a model in WinRunner or specify 'model'.", 503, "no_model_loaded")
+        raise self._no_model_error(jit)
+
+    def substitute_model(self, jit: bool) -> str | None:
+        """Id of the model that answers requests naming a model WinRunner does not know, if any."""
+        active = self._active()
+        if active is not None:
+            return active.model_id
+        loading = next((i for i in self.instances.values() if i.state in ("loading", "starting")), None)
+        if loading is not None:
+            return loading.model_id
+        if self._pending:
+            return next(iter(self._pending))
+        return self._default_model() if jit else None
+
+    def _active(self) -> EngineInstance | None:
+        """The loaded model that answers requests without a (known) model name: the most recently used one."""
+        ready = sorted(self.ready_instances(), key=lambda i: i.last_used, reverse=True)
+        return ready[0] if ready else None
+
+    def _default_model(self) -> str | None:
+        """Model to load just in time when none is loaded: the one used last."""
+        last = self.store.settings.startup.last_model
+        if last and self.library.get(last):
+            return last
+        entries = self.library.entries()
+        used = [(prof.last_loaded, e.id) for e in entries
+                if (prof := self.store.settings.models.get(e.path)) and prof.last_loaded > 0]
+        if used:
+            return max(used)[1]
+        llms = [e.id for e in entries if e.info.kind == "llm"]
+        return llms[0] if len(llms) == 1 else None
+
+    def _note_substitute(self, requested: str | None, inst: EngineInstance) -> None:
+        """Tell the user once per name when requests for another model are answered by ``inst``."""
+        if not requested or requested == inst.model_id:
+            return
+        entry = self.library.resolve(requested)
+        if entry is not None and entry.id == inst.model_id:
+            return  # an alias, file name or prefix of the model itself
+        key = (requested, inst.model_id)
+        if key in self._substitutes:
+            return
+        self._substitutes.add(key)
+        why = ("is not loaded and just-in-time loading is off" if entry is not None
+               else "is not a model in the library")
+        self.bus.activity_log(f"'{requested}' {why}: requests for it are answered by {inst.model_id}",
+                              category="request")
+
+    def _no_model_error(self, jit: bool) -> ModelError:
+        if not jit:
+            return ModelError("No model is loaded and just-in-time loading is off. Load a model in WinRunner "
+                              "(Library).", 503, "no_model_loaded")
+        return ModelError("No model is loaded yet. Load a model in WinRunner (Library), or name one of its models "
+                          "in the request (GET /v1/models lists them).", 503, "no_model_loaded")
 
     async def _drain(self, inst: EngineInstance, timeout: float = 300.0) -> None:
         """Wait for in-flight requests on an instance before it is evicted."""

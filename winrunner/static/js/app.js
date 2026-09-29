@@ -7,6 +7,7 @@ import { mountHeader } from './components/header.js';
 import { mountSidebar } from './components/sidebar.js';
 import { mountStatusBar } from './components/statusbar.js';
 import { runBoot } from './components/boot.js';
+import { initShortcuts } from './components/shortcuts.js';
 import { toast } from './components/ui.js';
 
 const PAGES = [
@@ -72,6 +73,7 @@ async function main() {
   mountHeader($('#hdr'));
   mountSidebar($('#side'));
   mountStatusBar($('#status'));
+  initShortcuts();
 
   let offline = null;
   store.on('ws', (up) => {

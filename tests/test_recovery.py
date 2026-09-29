@@ -10,129 +10,15 @@ from __future__ import annotations
 
 import json
 import sys
-import threading
 import time
-from pathlib import Path
 
 import httpx
 import pytest
 
-from tests.gguf_writer import llama_like
+from tests.harness import (CHAT, activity, chat, failed_instance, load, model_id, ready_instance, starts,
+                           stream_lines, wait_for)
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="the fake engine is started as a POSIX script")
-
-FAKE_ENGINE = Path(__file__).with_name("fake_engine.py")
-CHAT = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8}
-
-
-def wait_for(cond, timeout: float = 30.0, what: str = "condition"):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            value = cond()
-        except Exception:
-            value = None
-        if value:
-            return value
-        time.sleep(0.05)
-    raise AssertionError(f"timed out waiting for {what}")
-
-
-def starts(state: Path) -> int:
-    try:
-        return int((state / "starts").read_text())
-    except OSError:
-        return 0
-
-
-def activity(ctx) -> str:
-    return "\n".join(a["text"] for a in list(ctx.bus.activity))
-
-
-def ready_instance(ctx):
-    return next((i for i in list(ctx.manager.instances.values()) if i.state == "ready"), None)
-
-
-def failed_instance(ctx):
-    return next((i for i in list(ctx.manager.instances.values()) if i.state == "error" and i.recovering), None)
-
-
-@pytest.fixture
-def state(tmp_path: Path) -> Path:
-    d = tmp_path / "state"
-    d.mkdir()
-    return d
-
-
-@pytest.fixture
-def winrunner(tmp_path: Path, state: Path, monkeypatch):
-    """start(plan, server_settings, errors) -> (base_url, ctx) with a fake engine following ``plan``."""
-    import uvicorn
-
-    from winrunner import manager as mgr
-    from winrunner.app import create_app
-    from winrunner.paths import DataPaths
-    from winrunner.util import free_port
-
-    monkeypatch.setattr(mgr, "RECOVERY_DELAYS_S", (0.2, 0.3, 0.3))
-    monkeypatch.setattr(mgr, "DEVICE_POLL_S", 0.05)
-    monkeypatch.setenv("FAKE_ENGINE_STATE", str(state))
-    running = []
-
-    def start(plan: str, server: dict | None = None, errors: str = "data"):
-        monkeypatch.setenv("FAKE_ENGINE_PLAN", plan)
-        monkeypatch.setenv("FAKE_ENGINE_ERRORS", errors)
-        exe = tmp_path / "engine" / "llama-server"
-        exe.parent.mkdir()
-        exe.write_text(f"#!{sys.executable}\nimport runpy\nrunpy.run_path({str(FAKE_ENGINE)!r}, run_name='__main__')\n")
-        exe.chmod(0o755)
-        models = tmp_path / "models"
-        llama_like(models / "pub" / "repo" / "Test-7B-Q4_K_M.gguf")
-        llama_like(models / "pub" / "other" / "Other-1B-Q8_0.gguf", n_layer=2)
-        data = tmp_path / "data"
-        data.mkdir()
-        (data / "settings.json").write_text(json.dumps({
-            "library": {"model_dirs": [str(models)]},
-            "engine": {"engine_path": str(exe), "backend": "custom", "load_timeout_s": 60},
-            "defaults": {"context_length": 4096},
-            "server": server or {},
-            "startup": {"open_ui": "none"},
-        }))
-        app, ctx = create_app(DataPaths(data))
-        port = free_port()
-        ctx.extras.update(bound_host="127.0.0.1", bound_port=port)
-        srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
-        t = threading.Thread(target=srv.run, daemon=True)
-        t.start()
-        running.append((srv, t))
-        base = f"http://127.0.0.1:{port}"
-        wait_for(lambda: srv.started and ctx.library.entries(), what="WinRunner start")
-        return base, ctx
-
-    yield start
-    for srv, t in running:
-        srv.should_exit = True
-        t.join(timeout=30)
-
-
-def model_id(ctx, name: str = "test-7b") -> str:
-    return next(e.id for e in ctx.library.entries() if name in e.id)
-
-
-def load(base: str, ctx, name: str = "test-7b") -> None:
-    r = httpx.post(base + "/wr/api/models/load", json={"id": model_id(ctx, name)})
-    assert r.status_code == 202
-    wait_for(lambda: (i := ready_instance(ctx)) and i.model_id == model_id(ctx, name), what="model load")
-
-
-def chat(base: str, ctx, **extra) -> httpx.Response:
-    return httpx.post(base + "/v1/chat/completions", json={**CHAT, "model": model_id(ctx), **extra}, timeout=60)
-
-
-def stream_lines(base: str, ctx) -> list[str]:
-    with httpx.stream("POST", base + "/v1/chat/completions",
-                      json={**CHAT, "model": model_id(ctx), "stream": True}, timeout=60) as s:
-        return [ln for ln in s.iter_lines() if ln]
 
 
 def test_device_lost_request_runs_again_on_restarted_engine(winrunner, state):

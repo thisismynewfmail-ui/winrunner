@@ -577,6 +577,19 @@ def build_router(ctx: AppContext) -> APIRouter:
             asyncio.get_running_loop().call_later(0.3, stop)
         return {"exiting": True}
 
+    @r.post("/api/app/fullscreen")
+    async def app_fullscreen() -> Response:
+        toggle = ctx.extras.get("toggle_fullscreen")
+        if not toggle:
+            return _err(409, "Full screen is only controlled by WinRunner in its app window; in a browser use the "
+                             "browser's own F11.")
+        try:
+            on = await asyncio.to_thread(toggle)
+        except Exception as exc:
+            log.warning("could not toggle full screen: %s", exc)
+            return _err(500, f"could not toggle full screen: {exc}")
+        return JSONResponse({"fullscreen": on})
+
     # ----- websocket -------------------------------------------------------------------------------------
 
     @r.websocket("/ws")

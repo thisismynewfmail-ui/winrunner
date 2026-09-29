@@ -378,7 +378,15 @@ class OpenAIRouter:
                 return g
             e = self.ctx.library.resolve(model_id)
             if e is None:
-                return oai_error(404, f"Model '{model_id}' not found.", "model_not_found")
+                # Not in the library: requests naming it are answered by the active model (see
+                # ModelManager.instance_for_request), so describe that model under the requested name.
+                sub = self.ctx.manager.substitute_model(self.ctx.store.settings.server.jit_loading)
+                se = self.ctx.library.get(sub) if sub else None
+                if se is None:
+                    return oai_error(404, f"Model '{model_id}' not found and no model is loaded.", "model_not_found")
+                obj = next((o for o in self._model_objects(lms) if o["id"] == se.id), None) or {
+                    "id": se.id, "object": "model", "created": int(se.info.mtime), "owned_by": se.publisher or "winrunner"}
+                return JSONResponse({**obj, "id": model_id, "root": se.id})
             for o in self._model_objects(lms) or []:
                 if o["id"] == e.id:
                     return JSONResponse(o)

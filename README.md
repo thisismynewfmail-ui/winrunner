@@ -110,8 +110,15 @@ http://127.0.0.1:5070/v1          (on this PC)
 - **API key:** not required by default. Any string works as the key in clients that insist on one. You can require a
   key under **Settings › Network**.
 - **Model name:** use the model id shown in the Library (e.g. `qwen3-32b-q4_k_m`). Aliases, file names, LM Studio
-  style `publisher/repo` names and unique prefixes are also accepted. If a client sends an unknown name
-  (e.g. `gpt-4o`), the currently loaded model answers.
+  style `publisher/repo` names and unique prefixes are also accepted. Requests never fail because of the model
+  name:
+  - A name that is not in the library (e.g. `gpt-4o`, or a client's fixed default) is answered by the currently
+    loaded model.
+  - If no model is loaded, the model used last is loaded first (just-in-time loading).
+  - With just-in-time loading off, the loaded model also answers requests that name a different library model,
+    instead of switching models.
+
+  The activity log notes each substituted name once, and responses carry the id of the model that answered.
 
 Works with Open WebUI, SillyTavern, Continue, Cline, AnythingLLM, Msty, Chatbox, the OpenAI Python/JS SDKs,
 the LM Studio SDK and anything else that speaks the OpenAI API.
@@ -301,6 +308,9 @@ the right, and a status bar at the bottom.
 - per-GPU utilisation, VRAM, temperature, power and clock;
 - the live **token stream** of the current request, with token boundaries and reasoning shown dimmed;
 - the event log.
+
+**Keyboard.** **F2** hides or shows the title bar and the page tabs (remembered across restarts). **F11** switches
+the app window to full screen and back; in a web browser, F11 is the browser's own full screen.
 
 All settings persist in `data\settings.json`. Every setting has a tooltip.
 

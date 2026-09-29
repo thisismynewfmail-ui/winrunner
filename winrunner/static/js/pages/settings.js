@@ -79,6 +79,10 @@ export function mount(root) {
       'Scale text and controls (1.0 = 12 px base). Useful on high-DPI vertical monitors.');
     formRow(f, 'Activity panel', seg([['right', 'Right column'], ['bottom', 'Bottom']], ui.sidebar_position, (v) => save({ ui: { sidebar_position: v } })),
       'Right column suits portrait monitors wider than ~1000 px; bottom suits narrow windows.');
+    formRow(f, 'Keyboard', h('div', { class: 'col', style: { gap: '3px' } },
+      h('div', null, h('b', null, 'F2'), ' hides or shows the title bar and the page tabs'),
+      h('div', null, h('b', null, 'F11'), ' switches the app window to full screen and back')),
+      'In a web browser, F11 is the browser\'s own full screen.');
     host.append(group('Appearance', [cards, h('div', { class: 'divider' }), f], { icon: 'sliders' }), editor);
   }
 

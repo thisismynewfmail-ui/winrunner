@@ -37,6 +37,10 @@
 .hdr-clock { font-family: var(--font-mono); font-size: var(--fs-s); color: var(--tx-2); text-align: right; line-height: 1.25; }
 .hdr-clock b { color: var(--tx-0); font-size: var(--fs-l); font-weight: normal; }
 
+/* F2: title bar and page tabs hidden, the page and activity column use the space */
+:root.chrome-hidden #hdr, :root.chrome-hidden #tabs { display: none; }
+:root.chrome-hidden #app { grid-template-rows: minmax(0, 1fr) auto; }
+
 /* ---- body ---------------------------------------------------------------- */
 #body { display: grid; grid-template-columns: minmax(0, 1fr) var(--side-w); min-height: 0; }
 #main { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg-0); }
