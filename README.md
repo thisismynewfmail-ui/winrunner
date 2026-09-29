@@ -57,7 +57,8 @@ Python packages (`requirements.txt`): `fastapi`, `uvicorn[standard]`, `httpx`, `
 1. Install Miniconda if you do not have conda: <https://docs.conda.io/en/latest/miniconda.html>
 2. Download or clone this repository, e.g. to `C:\WinRunner`.
 3. Double-click **`install.bat`** (or run it from an Anaconda Prompt). It:
-   - creates the conda environment **`winrunner` with Python 3.11**,
+   - creates the conda environment **`winrunner` with Python 3.11** from conda-forge (Anaconda's default
+     channels are not used, so no Terms-of-Service prompt / `CondaToSNonInteractiveError`),
    - installs `requirements.txt`,
    - downloads the latest official **llama.cpp Vulkan** build into `data\engines\`.
 
@@ -68,7 +69,7 @@ Python packages (`requirements.txt`): `fastapi`, `uvicorn[standard]`, `httpx`, `
 ### Manual
 
 ```bat
-conda create -n winrunner python=3.11 -y
+conda create -n winrunner --override-channels -c conda-forge python=3.11 pip -y
 conda activate winrunner
 cd C:\WinRunner
 pip install -r requirements.txt
@@ -321,6 +322,7 @@ The whole folder is portable. Set `WINRUNNER_DATA` or `--data-dir` to keep data 
 
 | Symptom | Fix |
 |---|---|
+| `CondaToSNonInteractiveError` during setup | Update to the current `install.bat` (it installs from conda-forge only). If you create the environment by hand, add `--override-channels -c conda-forge`. |
 | Other computers cannot connect | Run `scripts\firewall.bat` as administrator (or allow Python on *private* networks when Windows asks). Check that Settings › Network › Bind address is `0.0.0.0`. |
 | "No llama.cpp engine installed" | Settings › Engine › *Check for llama.cpp releases* › Install (Vulkan). |
 | Engine reports no GPUs | Update the Adrenalin driver; *Re-detect engine and devices*. For ROCm builds install the AMD HIP SDK. |
