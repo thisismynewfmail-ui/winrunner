@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en" data-theme="classic" data-anim="full" data-crt="off" data-glow="on" data-side="right">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>WinRunner</title>
+<link rel="icon" href="/ui/img/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/ui/css/base.css">
+<link rel="stylesheet" href="/ui/css/vgui.css">
+<link rel="stylesheet" href="/ui/css/layout.css">
+<link rel="stylesheet" href="/ui/css/widgets.css">
+<link rel="stylesheet" href="/ui/css/pages.css">
+<link rel="stylesheet" href="/ui/css/effects.css">
+</head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+  <symbol id="logo" viewBox="0 0 48 48">
+    <rect x="3" y="3" width="42" height="42" style="fill:var(--bg-3);stroke:var(--acc);stroke-width:2"/>
+    <path d="M3 3h42v42" style="fill:none;stroke:var(--bd-hi);stroke-width:1;opacity:.5"/>
+    <path d="M8 13h32" style="fill:none;stroke:var(--acc);stroke-width:1;opacity:.35"/>
+    <path d="M11 17 L16.5 34 L24 21.5 L31.5 34 L37 17" style="fill:none;stroke:var(--acc);stroke-width:4.2;stroke-linejoin:miter;stroke-linecap:square"/>
+    <path d="M8 40h9M21 40h5M30 40h10" style="fill:none;stroke:var(--tx-2);stroke-width:2"/>
+  </symbol>
+  <symbol id="i-model" viewBox="0 0 16 16"><path d="M8 2 14 5 8 8 2 5Z M2 8l6 3 6-3 M2 11l6 3 6-3"/></symbol>
+  <symbol id="i-server" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="11" height="4"/><rect x="2.5" y="9.5" width="11" height="4"/><path d="M5 4.5h1.5M5 11.5h1.5"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 16 16"><path d="M2.5 3.5h11v7h-6l-3 3v-3h-2z"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 16 16"><path d="M2 13.5h12M2.5 11l3-4 3 2 3-5 2.5 3"/></symbol>
+  <symbol id="i-bench" viewBox="0 0 16 16"><path d="M2.5 12a5.5 5.5 0 1 1 11 0"/><path d="M8 12l3-4.5"/><path d="M4 12h1M11 12h1"/></symbol>
+  <symbol id="i-log" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11"/><path d="M4.5 6l2 2-2 2M8 10.5h3"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2.2M8 12.3v2.2M1.5 8h2.2M12.3 8h2.2M3.4 3.4l1.6 1.6M11 11l1.6 1.6M3.4 12.6 5 11M11 5l1.6-1.6"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 16 16"><path d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/></symbol>
+  <symbol id="i-tool" viewBox="0 0 16 16"><path d="M10.5 2.5a3 3 0 0 0-2.8 4.1L2.5 11.8l1.7 1.7 5.2-5.2a3 3 0 0 0 4.1-2.8l-1.8 1.8-1.7-.4-.4-1.7z"/></symbol>
+  <symbol id="i-think" viewBox="0 0 16 16"><path d="M5.5 10.5c-1-1-1.8-2-1.8-3.8a4.3 4.3 0 0 1 8.6 0c0 1.8-.8 2.8-1.8 3.8v1.5h-5z"/><path d="M6 14.5h4"/></symbol>
+  <symbol id="i-embed" viewBox="0 0 16 16"><path d="M3 12h.01M6 5h.01M9 9h.01M12 3.5h.01M12 12h.01M4 8h.01"/></symbol>
+  <symbol id="i-audio" viewBox="0 0 16 16"><path d="M2 8h1.5M4.5 5v6M7 3v10M9.5 6v4M12 4.5v7M14 8h-.5"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><path d="M4.5 3v10l8-5z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8"/></symbol>
+  <symbol id="i-eject" viewBox="0 0 16 16"><path d="M3 9.5 8 4l5 5.5z M3 12.5h10"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 16 16"><path d="M2 4.5h4l1.5 1.5H14v7H2z"/></symbol>
+  <symbol id="i-download" viewBox="0 0 16 16"><path d="M8 2.5v8M4.5 7 8 10.5 11.5 7M2.5 13.5h11"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8"/><path d="M3.5 10.5h-1v-8h8v1"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M3 8.5 6.5 12 13 4.5"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 16 16"><path d="M8 2.5 14 13.5H2z M8 7v3M8 11.8v.4"/></symbol>
+  <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4"/><path d="M10 10l3.5 3.5"/></symbol>
+  <symbol id="i-image" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10"/><path d="M2 11l3.5-3.5 3 3 2-2L14 12"/><path d="M10.5 6h.01"/></symbol>
+  <symbol id="i-send" viewBox="0 0 16 16"><path d="M2.5 8h9M8 4l4 4-4 4"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 16 16"><path d="M3 4.5h10M6 4.5V3h4v1.5M4.5 4.5l.5 9h6l.5-9"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></symbol>
+  <symbol id="i-chip" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8"/><path d="M6 1.5v2.5M10 1.5v2.5M6 12v2.5M10 12v2.5M1.5 6h2.5M1.5 10h2.5M12 6h2.5M12 10h2.5"/></symbol>
+  <symbol id="i-mem" viewBox="0 0 16 16"><rect x="1.5" y="5" width="13" height="6"/><path d="M4 11v2M7 11v2M10 11v2M13 11v2M4 7.5h8"/></symbol>
+  <symbol id="i-key" viewBox="0 0 16 16"><circle cx="5" cy="8" r="2.5"/><path d="M7.5 8h7M12 8v2.5M14 8v2"/></symbol>
+  <symbol id="i-power" viewBox="0 0 16 16"><path d="M8 2v6M4.8 4.5a5 5 0 1 0 6.4 0"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c2 2 2 10 0 12M8 2c-2 2-2 10 0 12"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 16 16"><path d="M9 1.5 3.5 9H8l-1 5.5L12.5 7H8z"/></symbol>
+  <symbol id="i-list" viewBox="0 0 16 16"><path d="M5 4h9M5 8h9M5 12h9M2 4h.5M2 8h.5M2 12h.5"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12"/><path d="M5 2.5v3M10.5 6.5v3M6.5 10.5v3"/></symbol>
+</svg>
+
+<div id="app">
+  <header id="hdr"></header>
+  <div id="body">
+    <main id="main">
+      <nav class="tabs" id="tabs" role="tablist"></nav>
+      <div id="page"></div>
+    </main>
+    <aside id="side"></aside>
+  </div>
+  <footer id="status"></footer>
+</div>
+<div id="crt"><div class="band"></div></div>
+<div id="boot"></div>
+<script type="module" src="/ui/js/app.js"></script>
+</body>
+</html>
