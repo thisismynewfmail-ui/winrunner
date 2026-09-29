@@ -40,6 +40,7 @@ export function mountHeader(root) {
   );
 
   let lastKey = '';
+  let shownNotice = null;
   function render() {
     const s = engineState();
     led.className = `led big ${s.led}`;
@@ -49,7 +50,11 @@ export function mountHeader(root) {
     stModel.dataset.tip = s.detail || '';
     const st = store.status;
     if (st?.server) setText(url, st.server.lan?.[0] || st.server.local);
-    exitBtn.classList.toggle('hidden', !st?.window);
+    exitBtn.classList.toggle('hidden', !(st?.can_exit ?? st?.window));
+    if (st?.notice && st.notice !== shownNotice) {
+      shownNotice = st.notice;
+      toast(st.notice, 'warn', 15000, 'App window unavailable');
+    }
     if (s.key !== lastKey) {
       document.title = `WinRunner - ${s.label}${s.detail && s.key !== 'idle' ? ` - ${s.detail}` : ''}`;
       lastKey = s.key;

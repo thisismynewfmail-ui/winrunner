@@ -44,7 +44,7 @@ Other Windows or Linux PCs with AMD, NVIDIA or Intel GPUs (or no GPU) work too.
 | Conda | Miniconda, Miniforge or Anaconda |
 | OS | Windows 10/11 x64 (Linux x64 also supported) |
 | GPU driver | AMD Software: Adrenalin Edition (recent); it provides Vulkan and the ADL sensor library |
-| Browser engine for the app window | Microsoft Edge WebView2 Runtime (preinstalled on current Windows 10/11) |
+| Browser engine for the app window | Microsoft Edge WebView2 Runtime (`install.bat` offers to install it; without it the control panel opens in the browser) |
 | Disk | ~300 MB for WinRunner + engine, plus your models |
 
 Python packages (`requirements.txt`): `fastapi`, `uvicorn[standard]`, `httpx`, `pydantic` 2, `psutil`, `pillow`,
@@ -323,6 +323,7 @@ The whole folder is portable. Set `WINRUNNER_DATA` or `--data-dir` to keep data 
 | Symptom | Fix |
 |---|---|
 | `CondaToSNonInteractiveError` during setup | Update to the current `install.bat` (it installs from conda-forge only). If you create the environment by hand, add `--override-channels -c conda-forge`. |
+| `WebView2 initialization failed` / `Couldn't find a compatible Webview2 Runtime` | The app window needs the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (Evergreen Bootstrapper), or re-run `install.bat`. Until it is installed, WinRunner opens the control panel in your browser; use the power button in the header to exit. |
 | Other computers cannot connect | Run `scripts\firewall.bat` as administrator (or allow Python on *private* networks when Windows asks). Check that Settings › Network › Bind address is `0.0.0.0`. |
 | "No llama.cpp engine installed" | Settings › Engine › *Check for llama.cpp releases* › Install (Vulkan). |
 | Engine reports no GPUs | Update the Adrenalin driver; *Re-detect engine and devices*. For ROCm builds install the AMD HIP SDK. |

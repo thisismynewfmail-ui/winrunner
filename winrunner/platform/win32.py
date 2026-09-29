@@ -701,3 +701,38 @@ def gpu_driver_versions() -> dict[str, str]:
     except Exception:
         pass
     return out
+
+
+_WEBVIEW2_CLIENT = r"Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+
+
+def webview2_version() -> str | None:
+    """Installed Microsoft Edge WebView2 Runtime version, or ``None`` when it is missing.
+
+    Uses the registry keys Microsoft documents for detecting the Evergreen runtime
+    (machine-wide and per-user) and also checks that the runtime files are still on
+    disk, because an uninstalled or damaged runtime can leave the ``pv`` value behind.
+    """
+    try:
+        import os
+        import winreg
+    except ImportError:
+        return None
+    keys = [
+        (winreg.HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\" + _WEBVIEW2_CLIENT),
+        (winreg.HKEY_LOCAL_MACHINE, "SOFTWARE\\" + _WEBVIEW2_CLIENT),
+        (winreg.HKEY_CURRENT_USER, "Software\\" + _WEBVIEW2_CLIENT),
+    ]
+    roots = [os.path.join(os.environ.get(v, ""), "Microsoft", "EdgeWebView", "Application")
+             for v in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA") if os.environ.get(v)]
+    for hive, path in keys:
+        try:
+            with winreg.OpenKey(hive, path) as k:
+                pv = str(winreg.QueryValueEx(k, "pv")[0]).strip()
+        except OSError:
+            continue
+        if not pv or pv == "0.0.0.0":
+            continue
+        if any(os.path.isfile(os.path.join(r, pv, "msedgewebview2.exe")) for r in roots):
+            return pv
+    return None

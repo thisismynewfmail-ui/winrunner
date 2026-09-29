@@ -73,6 +73,25 @@ def _install_engine(paths: DataPaths, backend: str) -> int:
     return asyncio.run(run())
 
 
+WINDOW_LOAD_TIMEOUT = 25.0
+WEBVIEW2_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+
+
+def _window_unavailable() -> str | None:
+    """Why the native window cannot be used, or ``None`` when it can."""
+    try:
+        import webview  # type: ignore  # noqa: F401
+    except ImportError:
+        return "pywebview is not installed"
+    if sys.platform == "win32":
+        from .platform import win32
+
+        if not win32.webview2_version():
+            return ("the Microsoft Edge WebView2 Runtime is not installed (needed for the app window; "
+                    f"download: {WEBVIEW2_URL} or re-run install.bat)")
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="winrunner", description=f"{PRODUCT_NAME} - local LLM inference server")
     ap.add_argument("--host", help="bind address for the API (default from settings: 0.0.0.0)")
@@ -128,12 +147,16 @@ def main(argv: list[str] | None = None) -> int:
 
     webview = None
     if open_mode == "window":
-        try:
-            import webview  # type: ignore
-        except ImportError:
-            log.warning("pywebview is not installed; opening the control panel in the browser instead")
+        reason = _window_unavailable()
+        if reason:
+            log.warning("%s; opening the control panel in the browser instead", reason)
+            ctx.extras["notice"] = f"{reason}. The control panel opened in the browser instead."
             open_mode = "browser"
+        else:
+            import webview  # type: ignore
 
+    # pythonw.exe has no console to close, so the control panel offers an Exit button.
+    ctx.extras["can_exit"] = open_mode == "window" or sys.stderr is None
     log.info("%s %s - API http://%s:%d/v1 - control panel %s", PRODUCT_NAME, __version__, host, port, ui_url)
 
     if open_mode == "window" and webview is not None:
@@ -155,6 +178,18 @@ def main(argv: list[str] | None = None) -> int:
             pass
         window = webview.create_window(f"{PRODUCT_NAME} {__version__}", ui_url, width=width, height=height,
                                        min_size=(760, 640), background_color="#1f241b", text_select=True)
+        loaded = threading.Event()
+        failed: list[str] = []
+        window.events.loaded += lambda *a: loaded.set()
+
+        def watchdog() -> None:
+            # A broken browser engine leaves an empty window that never loads the page.
+            if not loaded.wait(WINDOW_LOAD_TIMEOUT) and not server.should_exit:
+                failed.append(f"the app window did not load within {WINDOW_LOAD_TIMEOUT:.0f} s")
+                try:
+                    window.destroy()
+                except Exception:
+                    pass
 
         def request_exit() -> None:
             server.should_exit = True
@@ -165,10 +200,17 @@ def main(argv: list[str] | None = None) -> int:
 
         ctx.extras["request_exit"] = request_exit
         try:
-            webview.start(gui="edgechromium" if sys.platform == "win32" else None, private_mode=False)
+            webview.start(watchdog, gui="edgechromium" if sys.platform == "win32" else None, private_mode=False)
         except Exception as exc:
-            log.error("native window failed (%s); continuing headless - open %s", exc, ui_url)
-            t.join()
+            failed.append(f"the app window could not be created ({exc})")
+        loaded.set()  # release the watchdog thread when the window closes early
+        if failed and not server.should_exit:
+            log.warning("%s; opening the control panel in the browser instead", failed[0])
+            ctx.extras.update(window_mode=False, can_exit=True, request_exit=lambda: setattr(server, "should_exit", True),
+                              notice=f"The app window failed: {failed[0]}. Using the browser instead.")
+            webbrowser.open(ui_url)
+            while t.is_alive():  # keep serving until Exit is pressed in the control panel
+                t.join(timeout=1)
             return 0
         server.should_exit = True
         t.join(timeout=20)

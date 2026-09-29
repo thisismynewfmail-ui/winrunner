@@ -61,6 +61,8 @@ def build_router(ctx: AppContext) -> APIRouter:
             "active_requests": len(ctx.tracker.active),
             "system": ctx.extras.get("sysinfo"),
             "window": ctx.extras.get("window_mode", False),
+            "can_exit": bool(ctx.extras.get("can_exit") or ctx.extras.get("window_mode")),
+            "notice": ctx.extras.get("notice"),
         }
 
     @r.get("/api/status")
