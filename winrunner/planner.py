@@ -7,9 +7,12 @@ engine can see (with their current free memory), the planner decides:
   explicitly allows RoPE extension),
 * the KV cache precision (``auto`` prefers F16 and falls back to Q8_0 only if
   that is what makes a full GPU offload possible),
-* how layers are distributed across GPUs (``--tensor-split``), and - if the
-  model does not fit - how many layers (dense) or expert blocks (MoE) stay on
-  the CPU.
+* what gives way when the model and context do not fit in VRAM: by default the
+  context is reduced so every layer stays on the GPUs (``vram_overflow =
+  reduce_context``); keeping the context instead (``cpu_offload``) leaves
+  layers (dense) or expert blocks (MoE) in system RAM, which the engine then
+  streams over PCIe for every prompt batch - several times slower,
+* how layers are distributed across GPUs (``--tensor-split``).
 
 It produces a per-device memory breakdown (weights / KV cache / compute
 buffers / vision projector) used by the UI, and the corresponding engine
@@ -53,6 +56,8 @@ SWA_PATTERN_DEFAULTS = {
 }
 
 CTX_PAD = 256
+MIN_FIT_CTX = 4096  # never reduce the context below this to reach a full offload (llama.cpp uses the same floor)
+AUTO_UBATCH = 2048  # micro-batch used when weights live in system RAM (amortises the PCIe transfer)
 
 
 @dataclass
@@ -114,6 +119,12 @@ class Plan:
     max_ctx_full_offload: dict[str, int] = field(default_factory=dict)
     load_mode: str = "mmap"
     parallel: int = -1
+    batch: int = 2048
+    ubatch: int = 512
+    vram_overflow: str = "reduce_context"
+    ctx_reduced_from: int = 0  # requested context when it was reduced to keep the model in VRAM
+    cpu_expert_layers: list[int] = field(default_factory=list)  # layers whose MoE experts stay in system RAM
+    fits: bool = True  # estimated allocations stay within free VRAM minus margins
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     source: str = "estimate"
@@ -209,6 +220,66 @@ def _pad(x: int, n: int) -> int:
     return ((x + n - 1) // n) * n
 
 
+def floor_ctx(x: int) -> int:
+    """Round a fitted context down to a tidy value (multiple of 1024 above 8K, else of 256)."""
+    step = 1024 if x >= 8192 else CTX_PAD
+    return max(CTX_PAD, (int(x) // step) * step)
+
+
+# Placement messages are generated here and by the engine verification in manager.py;
+# both replace the messages that start with these prefixes.
+PLACEMENT_PREFIXES = ("Context reduced from", "Partial offload:", "Expert weights of", "Micro-batch raised",
+                      "The model does not fit in VRAM even", "KV cache set to Q8_0")
+_SET_REDUCE = " Set 'If it does not fit' to 'Reduce context' to keep everything in VRAM."
+
+
+def msg_ctx_reduced(requested: int, ctx: int) -> str:
+    return (f"Context reduced from {requested:,} to {ctx:,} tokens so the whole model stays in VRAM (with part of "
+            "the model in system RAM, prompt processing is several times slower). To keep the full context, set "
+            "'If it does not fit' to 'Offload to CPU', use a smaller quantization, or free VRAM.")
+
+
+def msg_partial_layers(on_gpu: int, n_layer: int, reduce: bool) -> str:
+    return (f"Partial offload: {on_gpu} of {n_layer} layers on the GPUs, {n_layer - on_gpu} in system RAM. Prompt "
+            "processing streams the CPU-side weights over PCIe for every batch and generation runs those layers on "
+            "the CPU - both several times slower than a full GPU offload." + ("" if reduce else _SET_REDUCE))
+
+
+def msg_partial_experts(n_moe_layers: int, n_layer: int, reduce: bool) -> str:
+    return (f"Expert weights of {n_moe_layers} of {n_layer} layers stay in system RAM (attention, shared weights and "
+            "the KV cache stay on the GPUs). Prompt processing streams those weights over PCIe for every batch and is "
+            "much slower than a full GPU offload." + ("" if reduce else _SET_REDUCE))
+
+
+def msg_ubatch(ub: int) -> str:
+    return (f"Micro-batch raised to {ub} tokens: weights in system RAM are streamed to the GPU once per micro-batch, "
+            "so larger batches process prompts much faster.")
+
+
+def msg_no_fit_min() -> str:
+    return (f"The model does not fit in VRAM even at a {MIN_FIT_CTX:,}-token context, so the requested context was "
+            "kept.")
+
+
+def msg_manual_over(over_mib: float) -> str:
+    return (f"Manual allocation exceeds free VRAM by {over_mib / 1024:.1f} GiB. Windows will page the excess into "
+            "shared system memory, which makes prompt processing and generation extremely slow. Use automatic "
+            "allocation, lower the context, or put fewer layers on the GPU.")
+
+
+def override_layers(pattern: str) -> list[int]:
+    """Layer indices named in a tensor-override list such as 'blk\\.14\\.ffn_(up|down)_exps=CPU,...'."""
+    import re
+
+    return sorted({int(m) for m in re.findall(r"blk\\?\.(\d+)\\?\.", pattern or "")})
+
+
+def msg_kv_q8(full_offload: bool) -> str:
+    if full_offload:
+        return "KV cache set to Q8_0 (near-lossless, half the size of F16) so more context fits in VRAM."
+    return "KV cache set to Q8_0 (near-lossless) to keep as much of the model on the GPU(s) as possible."
+
+
 def mmproj_estimate_mib(file_size: int) -> float:
     return file_size / MiB * 1.15 + 64
 
@@ -279,6 +350,8 @@ class Planner:
         self.draft = draft_info
         self.engine_fit = engine_fit
         self.model_id = model_id
+        self.ub = params.ubatch_size  # micro-batch in effect for the estimate
+        self.b = params.batch_size
 
     # ----- helpers ----------------------------------------------------------------
 
@@ -323,7 +396,7 @@ class Planner:
             for d in self.devices
         ]
         host = {"weights_mib": 0.0, "kv_mib": 0.0, "compute_mib": 0.0}
-        kvl = kv_layer_bytes(info, ctx, kv_k, kv_v, self.p.ubatch_size, self._n_seq(), self.p.swa_full)
+        kvl = kv_layer_bytes(info, ctx, kv_k, kv_v, self.ub, self._n_seq(), self.p.swa_full)
         if split is None:
             split = [max(1.0, d.free_mib - d.margin_mib) for d in devs]
         assign = assign_layers(n_layer, n_gpu if devs else 0, split) if devs else [-1] * (n_layer + 1)
@@ -360,11 +433,11 @@ class Planner:
             host["weights_mib"] += (info.output_bytes + info.other_bytes) / MiB
         for i, dp in enumerate(devs):
             if dp.layers or i == out_dev:
-                dp.compute_mib = compute_buffer_bytes(info, ctx, self.p.ubatch_size, flash, i == out_dev) / MiB
+                dp.compute_mib = compute_buffer_bytes(info, ctx, self.ub, flash, i == out_dev) / MiB
         if n_gpu < n_layer + 1 or not devs:
-            host["compute_mib"] = compute_buffer_bytes(info, ctx, self.p.ubatch_size, flash, out_dev < 0) / MiB
+            host["compute_mib"] = compute_buffer_bytes(info, ctx, self.ub, flash, out_dev < 0) / MiB
         else:
-            host["compute_mib"] = (self.p.ubatch_size * info.n_embd * 4 * 2) / MiB + 8
+            host["compute_mib"] = (self.ub * info.n_embd * 4 * 2) / MiB + 8
         if devs and self.mmproj_mib:
             if self.p.mmproj_offload:
                 devs[0].mmproj_mib = self.mmproj_mib
@@ -372,8 +445,8 @@ class Planner:
                 host["compute_mib"] += self.mmproj_mib
         if devs and self.draft is not None:
             dw = self.draft.weights_bytes / MiB
-            dkv = sum(kv_layer_bytes(self.draft, ctx, "f16", "f16", self.p.ubatch_size, 1, False)) / MiB
-            dcomp = compute_buffer_bytes(self.draft, ctx, self.p.ubatch_size, flash, True) / MiB
+            dkv = sum(kv_layer_bytes(self.draft, ctx, "f16", "f16", self.ub, 1, False)) / MiB
+            dcomp = compute_buffer_bytes(self.draft, ctx, self.ub, flash, True) / MiB
             tot = sum(split) or 1
             for dp, s in zip(devs, split):
                 dp.draft_mib = (dw + dkv) * s / tot
@@ -407,7 +480,7 @@ class Planner:
         info = self.info
         n_layer = info.n_layer
         start = max(n_layer + 1 - n_gpu, 0)
-        kvl = kv_layer_bytes(info, ctx, kv_k, kv_v, self.p.ubatch_size, self._n_seq(), self.p.swa_full)
+        kvl = kv_layer_bytes(info, ctx, kv_k, kv_v, self.ub, self._n_seq(), self.p.swa_full)
         costs = []
         for il in range(start, n_layer + 1):
             if il == n_layer:
@@ -421,7 +494,7 @@ class Planner:
         flash = self._flash_for_estimate()
         caps = []
         for i, d in enumerate(probe):
-            comp = compute_buffer_bytes(info, ctx, self.p.ubatch_size, flash, i == nd - 1) / MiB
+            comp = compute_buffer_bytes(info, ctx, self.ub, flash, i == nd - 1) / MiB
             caps.append(max(0.0, d.free_mib - d.margin_mib - comp - d.mmproj_mib - d.draft_mib))
         total_cost, total_cap = sum(costs), sum(caps)
         if total_cap <= 0 or total_cost <= 0:
@@ -437,36 +510,52 @@ class Planner:
             cum += c
         return [float(x) for x in counts]
 
-    def _max_ctx_full(self, kv: str, split: list[float] | None) -> int:
-        lo, hi = CTX_PAD, max(CTX_PAD, int(self.info.context_length or 131072))
-        if self.p.allow_context_over_train:
-            hi = max(hi, self.p.context_length)
-        k, v = kv, kv
+    def _try(self, ctx: int, kv: str, n_gpu: int, n_cpu_moe: int) -> tuple[bool, list[float] | None,
+                                                                         list[DevicePlan], dict[str, float]]:
+        """Layout for one configuration: (fits, split, devices, host)."""
+        k, v = self._kv_pair(kv)
+        s = self._split_for(ctx, k, v, n_gpu, n_cpu_moe)
+        d, h, _ = self._layout(ctx, k, v, n_gpu, n_cpu_moe, s)
+        return self._fits(d), s, d, h
+
+    def _max_ctx(self, kv: str, n_gpu: int, n_cpu_moe: int, hi: int) -> int:
+        """Largest context (multiple of CTX_PAD, <= hi) at which the configuration fits; 0 if none."""
         if not self.devices:
             return 0
-        devs, _, _ = self._layout(lo, k, v, self.info.n_layer + 1, 0, split)
-        if not self._fits(devs):
+        lo = CTX_PAD
+        if not self._try(lo, kv, n_gpu, n_cpu_moe)[0]:
             return 0
+        hi = max(lo, _pad(int(hi), CTX_PAD))
+        if self._try(hi, kv, n_gpu, n_cpu_moe)[0]:
+            return hi
         while hi - lo > CTX_PAD:
-            mid = _pad((lo + hi) // 2, CTX_PAD)
-            if mid >= hi:
+            mid = ((lo + hi) // 2) // CTX_PAD * CTX_PAD
+            if mid <= lo or mid >= hi:
                 break
-            devs, _, _ = self._layout(mid, k, v, self.info.n_layer + 1, 0, split)
-            if self._fits(devs):
+            if self._try(mid, kv, n_gpu, n_cpu_moe)[0]:
                 lo = mid
             else:
                 hi = mid
-        devs, _, _ = self._layout(hi, k, v, self.info.n_layer + 1, 0, split)
-        return hi if self._fits(devs) else lo
+        return lo
+
+    def _ctx_ceiling(self) -> int:
+        hi = max(CTX_PAD, int(self.info.context_length or 131072))
+        if self.p.allow_context_over_train:
+            hi = max(hi, int(self.p.context_length))
+        return hi
 
     # ----- main entry ---------------------------------------------------------------
 
     def plan(self) -> Plan:
         info, p = self.info, self.p
         ctx, notes = self.resolve_ctx()
+        ctx_req = ctx
         warnings: list[str] = []
         n_layer = info.n_layer
         full = n_layer + 1
+        has_dev = bool(self.devices)
+        reduce = p.vram_overflow == "reduce_context"
+        self.ub, self.b = p.ubatch_size, p.batch_size
 
         fa = p.flash_attn
         if p.kv_cache_type == "auto":
@@ -483,42 +572,65 @@ class Planner:
         manual = p.gpu_offload == "manual"
         chosen_kv = candidates[0]
         split: list[float] | None = None
-        n_gpu = full if self.devices else 0
+        n_gpu = full if has_dev else 0
         n_cpu_moe = 0
         devs: list[DevicePlan] = []
         host: dict[str, float] = {}
+        fits = True
 
-        if manual:
+        def reduce_to_fit(kv: str, ngl: int, ncmoe: int) -> bool:
+            """Shrink the context until the configuration fits (vram_overflow = reduce_context)."""
+            nonlocal ctx, split, devs, host, fits
+            mc = self._max_ctx(kv, ngl, ncmoe, ctx)
+            if mc < min(MIN_FIT_CTX, ctx):
+                return False
+            new = min(ctx, floor_ctx(mc))
+            ok, s, d, h = self._try(new, kv, ngl, ncmoe)
+            if not ok:
+                return False
+            ctx, split, devs, host, fits = new, s, d, h, True
+            return True
+
+        if not has_dev:
+            n_gpu = 0
             k, v = self._kv_pair(chosen_kv)
-            n_gpu = (full if p.n_gpu_layers < 0 else min(full, p.n_gpu_layers)) if self.devices else 0
+            devs, host, _ = self._layout(ctx, k, v, 0, 0, None)
+        elif manual:
+            n_gpu = full if p.n_gpu_layers < 0 else min(full, p.n_gpu_layers)
             n_cpu_moe = max(0, p.n_cpu_moe)
-            split = self._split_for(ctx, k, v, n_gpu, n_cpu_moe)
-            devs, host, _ = self._layout(ctx, k, v, n_gpu, n_cpu_moe, split)
-            if not self._fits(devs):
-                warnings.append("Manual configuration exceeds free VRAM on at least one GPU; the load may fail "
-                                "or spill into shared system memory (much slower).")
+            for kv in candidates:  # KV "auto": F16 when the manual layout fits, else Q8_0
+                chosen_kv = kv
+                fits, split, devs, host = self._try(ctx, kv, n_gpu, n_cpu_moe)
+                if fits:
+                    break
+            if not fits and reduce:
+                reduce_to_fit(chosen_kv, n_gpu, n_cpu_moe)
+            if not fits:
+                warnings.append(msg_manual_over(sum(max(0.0, -d.headroom_mib) for d in devs)))
         else:
             fitted = False
             for kv in candidates:
-                k, v = self._kv_pair(kv)
-                s = self._split_for(ctx, k, v, full, 0)
-                d, h, _ = self._layout(ctx, k, v, full, 0, s)
-                if self.devices and self._fits(d):
+                ok, s, d, h = self._try(ctx, kv, full, 0)
+                if ok:
                     chosen_kv, split, devs, host, n_gpu, fitted = kv, s, d, h, full, True
                     break
+            if not fitted and reduce:
+                chosen_kv = candidates[-1]
+                fitted = reduce_to_fit(chosen_kv, full, 0)
+                n_gpu = full
             if not fitted:
-                chosen_kv = candidates[-1] if self.devices else candidates[0]
+                chosen_kv = candidates[-1]
                 k, v = self._kv_pair(chosen_kv)
-                if not self.devices:
-                    n_gpu = 0
-                    devs, host, _ = self._layout(ctx, k, v, 0, 0, None)
-                elif info.expert_count and any(info.layer_expert_bytes):
+                if p.auto_batch and self.ub < AUTO_UBATCH:
+                    self.ub = AUTO_UBATCH
+                    self.b = max(self.b, self.ub)
+                    notes.append(msg_ubatch(self.ub))
+                if info.expert_count and any(info.layer_expert_bytes):
                     # MoE: keep attention + KV on GPU, move expert FFNs of the first N layers to system RAM.
                     best = None
                     for n in range(0, n_layer + 1):
-                        s = self._split_for(ctx, k, v, full, n)
-                        d, h, _ = self._layout(ctx, k, v, full, n, s)
-                        if self._fits(d):
+                        ok, s, d, h = self._try(ctx, chosen_kv, full, n)
+                        if ok:
                             best = (n, s, d, h)
                             break
                     if best is None:
@@ -526,41 +638,44 @@ class Planner:
                         best = (n_layer, s) + self._layout(ctx, k, v, full, n_layer, s)[:2]
                         warnings.append("Even with all expert weights in system RAM the model does not fit in VRAM; "
                                         "reduce the context length or use a smaller quantization.")
+                        fits = False
                     n_cpu_moe, split, devs, host = best
                     n_gpu = full
-                    notes.append(
-                        f"MoE offload: expert weights of the first {n_cpu_moe} of {n_layer} layers stay in system "
-                        "RAM; attention, shared weights and the KV cache stay on the GPU(s)."
-                    )
+                    warnings.append(msg_partial_experts(n_cpu_moe, n_layer, reduce))
                 else:
                     s0 = self._split_for(ctx, k, v, 0, 0)
                     best = (0, s0) + self._layout(ctx, k, v, 0, 0, s0)[:2]
                     for n in range(full, -1, -1):
-                        s = self._split_for(ctx, k, v, n, 0)
-                        d, h, _ = self._layout(ctx, k, v, n, 0, s)
-                        if self._fits(d):
+                        ok, s, d, h = self._try(ctx, chosen_kv, n, 0)
+                        if ok:
                             best = (n, s, d, h)
                             break
                     n_gpu, split, devs, host = best
                     on_gpu = sum(dp.layers for dp in devs)
-                    notes.append(f"Partial offload: {on_gpu} of {n_layer} layers on GPU, {n_layer - on_gpu} on the "
-                                 "CPU (prompt processing and generation will be slower).")
+                    warnings.append(msg_partial_layers(on_gpu, n_layer, reduce))
+                if reduce:
+                    notes.append(msg_no_fit_min())
 
         k, v = self._kv_pair(chosen_kv)
-        full_offload = bool(self.devices) and n_gpu >= full and n_cpu_moe == 0
+        full_offload = has_dev and n_gpu >= full and n_cpu_moe == 0
+        if ctx < ctx_req:
+            warnings.insert(0, msg_ctx_reduced(ctx_req, ctx))
         if p.kv_cache_type == "auto" and chosen_kv != "f16":
-            if full_offload:
-                notes.append("KV cache set to Q8_0 (near-lossless) so the full context fits in VRAM.")
-            else:
-                notes.append("KV cache set to Q8_0 (near-lossless) to keep as much of the model on the GPU(s) as possible.")
+            notes.append(msg_kv_q8(full_offload))
         if fa == "auto" and (k in QUANTIZED_KV or v in QUANTIZED_KV):
             fa = "on"
 
-        kv_total = sum(kv_layer_bytes(info, ctx, k, v, p.ubatch_size, self._n_seq(), p.swa_full)) / MiB
-        max_ctx = {}
-        if self.devices:
-            for kvt in ("f16", "q8_0"):
-                max_ctx[kvt] = self._max_ctx_full(kvt, split)
+        kv_total = sum(kv_layer_bytes(info, ctx, k, v, self.ub, self._n_seq(), p.swa_full)) / MiB
+        max_ctx: dict[str, int] = {}
+        if has_dev:
+            saved = self.ub, self.b
+            self.ub, self.b = p.ubatch_size, p.batch_size
+            hi = self._ctx_ceiling()
+            for kvt in ("f16", "q8_0", "q4_0"):
+                if kvt != "f16" and fa == "off":
+                    continue
+                max_ctx[kvt] = self._max_ctx(kvt, full, 0, hi)
+            self.ub, self.b = saved
 
         load_mode = p.load_mode
         if load_mode == "auto":
@@ -582,6 +697,7 @@ class Planner:
             gpu_layers=min(n_gpu, full),
             full_offload=full_offload,
             n_cpu_moe=n_cpu_moe,
+            cpu_expert_layers=list(range(n_cpu_moe)),
             tensor_split=split if split and len(self.devices) > 1 else None,
             split_mode=p.split_mode,
             devices=devs,
@@ -597,6 +713,11 @@ class Planner:
             max_ctx_full_offload=max_ctx,
             load_mode=load_mode,
             parallel=p.parallel,
+            batch=self.b,
+            ubatch=self.ub,
+            vram_overflow=p.vram_overflow,
+            ctx_reduced_from=ctx_req if ctx < ctx_req else 0,
+            fits=bool(fits and (not devs or self._fits(devs))),
             warnings=warnings,
             notes=notes,
             use_engine_fit=self.engine_fit and not manual,

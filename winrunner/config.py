@@ -64,7 +64,8 @@ class EngineSettings(_Model):
 
 
 class HardwareSettings(_Model):
-    vram_margin_mib: int = 1024
+    vram_margin_mib: int = 1024  # GPUs that drive a display or are used by other applications
+    vram_margin_idle_mib: int = 512  # GPUs used by nothing but WinRunner
     vram_margin_per_device: dict[str, int] = Field(default_factory=dict)
     telemetry_interval_s: float = 1.0
 
@@ -74,6 +75,10 @@ class LoadParams(_Model):
 
     context_length: int = 65536
     allow_context_over_train: bool = False
+    # What to give up when the model plus the requested context does not fit in VRAM:
+    # "reduce_context" keeps every layer on the GPUs (fast), "cpu_offload" keeps the
+    # context and moves layers / expert weights to system RAM (much slower).
+    vram_overflow: Literal["reduce_context", "cpu_offload"] = "reduce_context"
     gpu_offload: Literal["auto", "manual"] = "auto"
     n_gpu_layers: int = -1  # manual mode: -1 = all layers
     n_cpu_moe: int = 0  # manual mode
@@ -87,6 +92,9 @@ class LoadParams(_Model):
     kv_offload: bool = True
     batch_size: int = 2048
     ubatch_size: int = 512
+    # With weights in system RAM every micro-batch streams them to the GPU over PCIe;
+    # a larger micro-batch amortises that transfer (much faster prompt processing).
+    auto_batch: bool = True
     parallel: int = -1  # -1 = engine auto
     threads: int = 0  # 0 = engine auto (physical cores)
     threads_batch: int = 0

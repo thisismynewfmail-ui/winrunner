@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -26,6 +27,19 @@ from .config import LoadParams
 from .util import new_id
 
 log = logging.getLogger("winrunner.instance")
+
+MiB = 1024 * 1024
+
+
+_GPU_BUFFER = re.compile(r"(?:Vulkan|ROCm|CUDA|HIP|SYCL|MUSA|CANN|OpenCL|MTL|Metal)\d+")
+
+
+def is_host_buffer(name: str) -> bool:
+    """True for engine buffers in system RAM: CPU, CPU_Mapped, CPU_REPACK, AMX, Vulkan_Host ...
+
+    GPU buffers carry the device name (Vulkan0, ROCm1 ...); everything else is host memory.
+    """
+    return not _GPU_BUFFER.fullmatch(name or "")
 
 # Load progress checkpoints (fraction of the whole load) per engine phase.
 PHASE_PROGRESS = {
@@ -116,7 +130,8 @@ class EngineInstance:
         self.load_info: dict[str, Any] = {
             "buffers": {}, "breakdown": {}, "offload": None, "kv": None, "ctx": {}, "flash_attn": None,
             "slots": {}, "mmproj": {}, "template_example": "", "thinking": None, "fit": [], "device_info": {},
-            "backend": {}, "load_seconds": None, "errors": [],
+            "backend": {}, "load_seconds": None, "errors": [], "device_pci": {}, "placement": None,
+            "vram_spill_active": False, "vram_spill_mib": 0,
         }
         self.props: dict[str, Any] = {}
         self.template_verified: bool | None = None
@@ -216,12 +231,20 @@ class EngineInstance:
         self._set_phase("ready")
         self.progress = 1.0
         self.state = "ready"
+        pl = self.load_info["placement"] = self.placement()
         self._emit_state()
         msg = f"{self.model_id} ready in {self.load_info['load_seconds']:.1f} s"
         off = self.load_info.get("offload")
         if off:
             msg += f" · {off['gpu_layers']}/{off['total_layers']} layers on GPU"
+        msg += f" · context {self.n_ctx:,}"
         self.bus.activity_log(msg, level="ok", category="model", model=self.model_id)
+        if pl["partial"] and pl["gpu_devices"]:
+            self.bus.activity_log(
+                f"{self.model_id}: {pl['cpu_weights_mib'] / 1024:.1f} GiB of model weights are in system RAM - prompt "
+                "processing streams them over PCIe for every batch and will be several times slower than with the "
+                "whole model in VRAM. Lower the context or use 'Reduce context' in the load settings.",
+                level="warn", category="model", model=self.model_id)
         if self.template_verified is False:
             self.bus.activity_log(
                 f"{self.model_id}: engine chat template differs from the GGUF's embedded template", level="warn",
@@ -331,6 +354,8 @@ class EngineInstance:
                     li["thinking"] = d["thinking"]
             elif kind == "device_info":
                 li["device_info"][str(d["index"])] = d["info"]
+            elif kind == "device_pci":
+                li["device_pci"][d["device"]] = d["pci"]
             elif kind == "backend":
                 li["backend"].update({k: v for k, v in d.items() if k != "path"})
             elif kind == "error":
@@ -388,6 +413,28 @@ class EngineInstance:
                              phase=self.phase, label=PHASE_LABELS.get(self.phase, self.phase))
 
     # ----- status -------------------------------------------------------------------
+
+    @property
+    def n_ctx(self) -> int:
+        return int((self.props.get("default_generation_settings") or {}).get("n_ctx")
+                   or self.load_info["ctx"].get("n_ctx") or self.plan.ctx)
+
+    def placement(self) -> dict[str, Any]:
+        """Where the weights actually went, from the engine's load log."""
+        li = self.load_info
+        off = li.get("offload") or {}
+        bufs = li.get("buffers") or {}
+        host_model = sum(float(b.get("model", 0)) for dev, b in bufs.items() if is_host_buffer(dev))
+        gpu_devices = sorted(dev for dev, b in bufs.items() if not is_host_buffer(dev) and b.get("model"))
+        embd = self.entry.info.token_embd_bytes / MiB  # the input embeddings always stay in system RAM
+        cpu_weights = max(0.0, host_model - embd)
+        gl, tl = off.get("gpu_layers"), off.get("total_layers")
+        partial = bool((gl is not None and tl and gl < tl) or cpu_weights > 256)
+        return {
+            "gpu_layers": gl, "total_layers": tl, "cpu_weights_mib": round(cpu_weights), "partial": partial,
+            "gpu_devices": gpu_devices, "graph_splits": li["ctx"].get("graph_splits"),
+            "pipeline_parallel": bool(li["ctx"].get("pipeline_parallel")),
+        }
 
     @property
     def vision_enabled(self) -> bool:

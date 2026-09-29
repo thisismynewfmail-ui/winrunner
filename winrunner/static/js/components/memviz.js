@@ -128,9 +128,10 @@ export function layerMap() {
     const gpuTotal = counts.reduce((a, b) => a + b, 0);
     let il = n - gpuTotal;
     counts.forEach((c, di) => { for (let k = 0; k < c && il < n; k++) owner[il++] = di; });
-    const moe = plan.n_cpu_moe || 0;
+    const moeLayers = plan.cpu_expert_layers?.length ? plan.cpu_expert_layers : [...Array(plan.n_cpu_moe || 0).keys()];
+    const moeSet = new Set(moeLayers);
     const lit = loading ? Math.floor(Math.max(0, Math.min(1, (progress - 0.12) / 0.72)) * n) : n;
-    const s = `${n}|${owner.join(',')}|${moe}|${lit}|${loading}`;
+    const s = `${n}|${owner.join(',')}|${moeLayers.join(',')}|${lit}|${loading}`;
     if (s === sig) return;
     const rebuild = sig.split('|')[0] !== String(n) || !grid.children.length;
     sig = s;
@@ -146,7 +147,7 @@ export function layerMap() {
       const d = owner[i];
       const color = d >= 0 ? `var(${DEV_COLORS[d % DEV_COLORS.length]})` : 'var(--c-other)';
       const where = d >= 0 ? devs[d]?.name || `GPU${d}` : 'CPU';
-      if (d >= 0 && i < moe) {
+      if (d >= 0 && moeSet.has(i)) {
         b.style.background = `linear-gradient(to bottom, ${color} 0 45%, var(--c-other) 45% 100%)`;
         b.dataset.tip = `Layer ${i}: attention on ${where}, expert weights in system RAM`;
       } else {
@@ -168,7 +169,7 @@ export function layerMap() {
         `${devs[di]?.name || `GPU${di}`}: ${c} layers`));
     });
     if (n - gpuTotal > 0) legend.appendChild(h('span', null, h('i', { style: { background: 'var(--c-other)' } }), `CPU: ${n - gpuTotal} layers`));
-    if (moe) legend.appendChild(h('span', null, h('i', { class: 'split' }), `${moe} layers with experts in RAM`));
+    if (moeSet.size) legend.appendChild(h('span', null, h('i', { class: 'split' }), `${moeSet.size} layers with experts in RAM`));
   };
   return el;
 }

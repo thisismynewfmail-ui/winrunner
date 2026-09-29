@@ -77,6 +77,11 @@ export function loadForm(opts) {
     row('Above trained context', 'allow_context_over_train',
       toggle('Allow (RoPE scaling)', v.allow_context_over_train, (x) => { set('allow_context_over_train', x); updateCtxHint(); }),
       null, 'Without this, contexts above the model\'s trained length are clamped to it.');
+    row('If it does not fit', 'vram_overflow', seg([
+      ['reduce_context', 'Reduce context', 'Keep every layer in VRAM and shrink the context until it fits (fastest)'],
+      ['cpu_offload', 'Offload to CPU', 'Keep the full context and put the layers that do not fit in system RAM (several times slower)']],
+    v.vram_overflow, (x) => set('vram_overflow', x)),
+    'What gives way when the model and this context need more VRAM than is free. With layers in system RAM every prompt batch streams them over PCIe.');
 
     // ---- GPU offload ------------------------------------------------------
     sec('GPU offload');
@@ -145,7 +150,7 @@ export function loadForm(opts) {
       'Fused attention kernel: far smaller compute buffers at long context. Required for a quantized V cache.',
       'Supported by the Vulkan and ROCm backends on RDNA2.');
     row('KV cache type', 'kv_cache_type', select(KV_OPTS, v.kv_cache_type, (x) => set('kv_cache_type', x), { style: { minWidth: '240px' } }),
-      'Precision of the attention key/value cache. Auto keeps F16 and uses Q8_0 only if that enables a full GPU offload.');
+      'Precision of the attention key/value cache. Auto keeps F16 and uses Q8_0 only if that fits more of the context in VRAM. Q4_0 fits twice as much again (slightly lossy).');
     row('V cache type', 'kv_cache_type_v', select([['', 'Same as K'], ...KV_OPTS.filter(([k]) => k !== 'auto')], v.kv_cache_type_v,
       (x) => set('kv_cache_type_v', x)), null, 'Separate precision for the value cache (advanced).');
     row('KV cache on GPU', 'kv_offload', toggle('Offload KV cache', v.kv_offload, (x) => set('kv_offload', x)), null,
@@ -161,6 +166,8 @@ export function loadForm(opts) {
       null, 'Logical batch: maximum tokens submitted per decode call.');
     row('Micro-batch size', 'ubatch_size', select([128, 256, 512, 1024, 2048, 4096].map((x) => [x, String(x)]), v.ubatch_size, (x) => set('ubatch_size', Number(x))),
       'Physical batch per GPU pass. Larger values speed up prompt processing and use more compute buffer VRAM.');
+    row('Offload batching', 'auto_batch', toggle('Raise micro-batch to 2048 when weights are in system RAM', v.auto_batch, (x) => set('auto_batch', x)),
+      'CPU-side weights are copied to the GPU once per micro-batch; a larger batch cuts that PCIe traffic by 4x.');
     row('Parallel slots', 'parallel', select([[-1, 'Auto (4, shared context)'], [1, '1'], [2, '2'], [3, '3'], [4, '4'], [6, '6'], [8, '8']], v.parallel,
       (x) => set('parallel', Number(x))), 'Concurrent requests. Slots share one unified KV cache, so a single request can still use the full context.');
     row('Threads', 'threads', h('div', { class: 'row' },

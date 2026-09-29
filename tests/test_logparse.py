@@ -81,3 +81,15 @@ def test_errors_and_jsonl():
     assert ("offload", {"gpu_layers": 10, "total_layers": 65}) in ev
     fatal = events(["0.00.1.0 I llama_model_load: error loading model: vk::DeviceLostError"])
     assert any(k == "error" for k, _ in fatal)
+
+
+def test_device_pci_and_graph_splits():
+    ev = events([
+        "0.00.100.000 I llama_model_load_from_file_impl: using device Vulkan0 (AMD Radeon RX 6800) (0000:0B:00.0) - 15888 MiB free",
+        "0.00.100.001 I llama_model_load_from_file_impl: using device Vulkan1 (AMD Radeon RX 6800) (0000:0c:00.0) - 16012 MiB free",
+        "0.00.200.000 I sched_reserve: graph (pp bs=512, tg bs=4): nodes = 3334 / 2854, splits = 3 / 3, input objects = 1, input tensors = 7",
+    ])
+    assert ev[0] == ("device_pci", {"device": "Vulkan0", "description": "AMD Radeon RX 6800", "pci": "0000:0b:00.0",
+                                    "free_mib": 15888})
+    assert ev[1][1]["pci"] == "0000:0c:00.0"
+    assert ev[2] == ("ctx", {"graph_splits": 3, "graph_splits_tg": 3})

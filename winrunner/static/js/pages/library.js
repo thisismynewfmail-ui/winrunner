@@ -7,6 +7,7 @@ import * as fmt from '../core/fmt.js';
 import { group, btn, seg, select, input, toggle, toast, modal, kv, stat, empty, copyBtn, confirmBox } from '../components/ui.js';
 import { loadForm } from '../components/loadform.js';
 import { memBars, planDevices, actualDevices, layerMap } from '../components/memviz.js';
+import { placementNotes } from '../components/sidebar.js';
 import { navigate, takeNavParams } from '../app.js';
 
 let lastSelected = null;
@@ -207,6 +208,9 @@ export function mount(root) {
       stat('KV cache', li.kv ? `${li.kv.k_type === li.kv.v_type ? li.kv.k_type : `${li.kv.k_type}/${li.kv.v_type}`} ${fmt.mib(li.kv.mib)}` : '-'),
       stat('Flash attn', li.flash_attn === null || li.flash_attn === undefined ? '-' : li.flash_attn ? 'on' : 'off'),
       stat('GPU layers', li.offload ? `${li.offload.gpu_layers}/${li.offload.total_layers}` : '-'),
+      stat('Weights in RAM', li.placement ? fmt.mib(li.placement.cpu_weights_mib) : '-', 'Model weights the engine keeps in system RAM (excluding the input embeddings, which always stay there)'),
+      stat('Graph splits', li.placement?.graph_splits ?? '-', 'Hand-offs between devices per forward pass. A full offload across two GPUs needs about 3; many more means work bounces between the CPU and the GPUs.'),
+      stat('Pipeline', li.placement ? (li.placement.pipeline_parallel ? 'parallel' : 'serial') : '-', 'Pipeline parallelism lets both GPUs work on different micro-batches of a long prompt at the same time (needs a full offload).'),
       stat('Slots', li.slots?.n_slots ?? '-'),
       stat('Load time', li.load_seconds ? `${li.load_seconds} s` : '-'),
       stat('Template', inst.template_verified === true ? 'GGUF ✓' : inst.template_verified === false ? 'differs' : inst.params?.chat_template_mode || '-',
@@ -215,7 +219,8 @@ export function mount(root) {
     bars.update(actualDevices(inst, devices));
     const lm = layerMap();
     lm.update(inst.plan, { loadInfo: li, loading: inst.state !== 'ready', progress: inst.progress });
-    actualView.append(s, h('div', { class: 'divider' }), bars, lm,
+    actualView.append(...placementNotes(inst).map(([lvl, text, tip]) => h('div', { class: `note ${lvl}` }, text, tip ? h('div', { class: 'dim' }, tip) : null)),
+      s, h('div', { class: 'divider' }), bars, lm,
       inst.error ? h('div', { class: 'note err' }, inst.error) : null);
   }
 
@@ -234,21 +239,26 @@ export function mount(root) {
       if (r.devices?.length) devices = r.devices;
       clear(planStatus);
       const full = p.full_offload;
-      const cls = !r.devices?.length ? 'warn' : full ? 'ok' : 'warn';
-      const headline = !r.devices?.length ? 'CPU ONLY' : full ? 'FULL GPU OFFLOAD' : p.n_cpu_moe ? 'GPU + EXPERTS IN RAM' : 'PARTIAL OFFLOAD';
-      planStatus.append(h('span', { class: `led ${cls === 'ok' ? 'ok' : 'warn'}` }), h('b', { class: cls }, headline),
+      const over = p.fits === false;
+      const cls = over ? 'err' : !r.devices?.length ? 'warn' : full ? 'ok' : 'warn';
+      const headline = over ? 'EXCEEDS VRAM' : !r.devices?.length ? 'CPU ONLY' : full ? (p.ctx_reduced_from ? 'FULL GPU OFFLOAD · CONTEXT REDUCED' : 'FULL GPU OFFLOAD')
+        : p.n_cpu_moe ? 'GPU + EXPERTS IN RAM (SLOW PROMPTS)' : 'PARTIAL OFFLOAD (SLOW PROMPTS)';
+      planStatus.append(h('span', { class: `led ${cls === 'ok' ? 'ok' : cls === 'err' ? 'err' : 'warn'}` }), h('b', { class: cls }, headline),
         h('span', { class: 'dim' }, p.source === 'engine' ? 'verified by engine projection (llama-fit-params)' : p.use_engine_fit ? 'estimate · engine fits layers at load' : 'estimate'));
       clear(planStats);
       const vramUsed = p.devices.reduce((a, x) => a + x.used_mib, 0);
       const vramFree = p.devices.reduce((a, x) => a + x.free_mib - x.margin_mib, 0);
       planStats.append(
-        stat('Context', fmt.num(p.ctx), p.ctx !== p.ctx_requested ? `Requested ${fmt.num(p.ctx_requested)}` : null),
+        stat('Context', fmt.num(p.ctx), p.ctx_reduced_from ? `Reduced from ${fmt.num(p.ctx_reduced_from)} to keep every layer in VRAM`
+          : p.ctx !== p.ctx_requested ? `Requested ${fmt.num(p.ctx_requested)}` : null),
         stat('KV cache', `${p.kv_k.toUpperCase()} · ${fmt.mib(p.totals.kv_mib)}`, `${fmt.bytes(p.kv_bytes_per_token)} per token`),
         stat('Flash attn', p.flash_attn),
         stat('GPU layers', `${Math.min(p.gpu_layers, p.n_layer + 1)}/${p.n_layer + 1}`),
         stat('VRAM', `${fmt.mib(vramUsed)} / ${fmt.mib(vramFree)}`, 'Planned use vs. free VRAM after safety margins'),
-        stat('Max full-offload ctx', p.max_ctx_full_offload?.f16 !== undefined ? `${fmt.ctx(p.max_ctx_full_offload.f16)} F16 · ${fmt.ctx(p.max_ctx_full_offload.q8_0)} Q8_0` : '-',
-          'Largest context that still fits entirely in VRAM with each KV cache type'),
+        stat('Max full-offload ctx', p.max_ctx_full_offload?.f16 !== undefined
+          ? Object.entries(p.max_ctx_full_offload).map(([k, x]) => `${x ? fmt.ctx(x) : 'none'} ${k.toUpperCase()}`).join(' · ') : '-',
+        'Largest context that still fits entirely in VRAM with each KV cache type (estimate)'),
+        stat('Micro-batch', `${p.ubatch} / ${p.batch}`, 'Physical / logical batch size in tokens'),
         stat('Load mode', p.load_mode));
       bars.update(planDevices(p), { host: p.host });
       lmap.update(p);

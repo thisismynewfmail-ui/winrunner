@@ -221,19 +221,32 @@ export function mount(root) {
         h('td', null, g.bus ?? '-'), h('td', null, g.driver || '-'), h('td', null, dev || '-')));
     }
     const dtb = h('tbody');
+    const ROLE = { display: 'Display', idle: 'Compute only', busy: 'Shared with apps', unknown: 'Unknown' };
+    const ROLE_TIP = {
+      display: 'Drives a monitor: the desktop and applications can take more VRAM at any time, so the full margin is kept.',
+      idle: 'Used only by WinRunner: the smaller margin applies.',
+      busy: 'Other applications hold VRAM on this GPU: the full margin is kept.',
+      unknown: 'Could not tell whether this GPU drives a display (identical cards are told apart after the first model load): the full margin is kept.',
+    };
     for (const e of d.engine_devices || []) {
       const margin = hw.vram_margin_per_device?.[e.name];
+      const role = d.device_roles?.[e.name] || 'unknown';
       dtb.appendChild(h('tr', null, h('td', null, h('b', null, e.name)), h('td', null, e.description), h('td', { class: 'num' }, `${fmt.num(e.total_mib)} MiB`),
-        h('td', { class: 'num' }, `${fmt.num(e.free_mib)} MiB`), h('td', { class: 'dim', style: { whiteSpace: 'normal', fontSize: '10px' } }, e.details || ''),
+        h('td', { class: 'num' }, `${fmt.num(e.free_mib)} MiB`), h('td', { 'data-tip': ROLE_TIP[role] }, ROLE[role]),
+        h('td', { class: 'dim', style: { whiteSpace: 'normal', fontSize: '10px' } }, [e.pci ? `PCI ${e.pci} · ` : '', e.details || '']),
         h('td', null, input(margin ?? '', (v) => {
           const m = { ...(S().hardware.vram_margin_per_device || {}) };
           if (v === '' || v === null || isNaN(v)) delete m[e.name]; else m[e.name] = Number(v);
           save({ hardware: { vram_margin_per_device: m } });
-        }, { type: 'number', cls: 'num', placeholder: String(hw.vram_margin_mib), style: { width: '80px' } }))));
+        }, { type: 'number', cls: 'num', placeholder: String(d.device_margins?.[e.name] ?? hw.vram_margin_mib), style: { width: '80px' } }))));
     }
     const f = h('div', { class: 'form' });
-    formRow(f, 'VRAM safety margin', h('div', { class: 'row' }, input(hw.vram_margin_mib, (v) => save({ hardware: { vram_margin_mib: Number(v) } }), { type: 'number', cls: 'num', min: 0, step: 128 }),
-      h('span', { class: 'dim' }, 'MiB per GPU')), 'Kept free on every GPU for the desktop, browser and driver. Per-device values can be set in the table above.');
+    formRow(f, 'VRAM safety margin', h('div', { class: 'row' },
+      input(hw.vram_margin_mib, (v) => save({ hardware: { vram_margin_mib: Number(v) } }), { type: 'number', cls: 'num', min: 0, step: 128 }),
+      h('span', { class: 'dim' }, 'MiB · display / shared GPUs'),
+      input(hw.vram_margin_idle_mib, (v) => save({ hardware: { vram_margin_idle_mib: Number(v) } }), { type: 'number', cls: 'num', min: 0, step: 128 }),
+      h('span', { class: 'dim' }, 'MiB · compute-only GPUs')),
+    'VRAM kept free so Windows never has to page model memory out of VRAM (that makes inference extremely slow). A GPU that drives a monitor needs more for the desktop and applications. Per-device values can be set in the table above.');
     formRow(f, 'Telemetry interval', select([[0.5, '0.5 s'], [1, '1 s'], [2, '2 s'], [5, '5 s']], hw.telemetry_interval_s, (v) => save({ hardware: { telemetry_interval_s: Number(v) } })));
     host.append(
       group('System', kv([['Operating system', sys.os], ['Processor', `${sys.cpu} · ${sys.cores_physical} cores / ${sys.cores_logical} threads`],
@@ -243,7 +256,7 @@ export function mount(root) {
         ['ID', 'Adapter', 'Vendor', 'VRAM', 'PCI bus', 'Driver', 'Engine device'].map((x, i) => h('th', { class: i === 3 ? 'num' : '' }, x)))), gtb))
         : h('div', { class: 'dim' }, 'No discrete GPUs reported.'), { icon: 'chip' }),
       group('Engine devices', [(d.engine_devices || []).length ? h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' }, h('thead', null, h('tr', null,
-        ['Device', 'Description', 'Total', 'Free now', 'Backend details', 'Margin MiB'].map((x, i) => h('th', { class: i === 2 || i === 3 ? 'num' : '' }, x)))), dtb))
+        ['Device', 'Description', 'Total', 'Free now', 'Role', 'Backend details', 'Margin MiB'].map((x, i) => h('th', { class: i === 2 || i === 3 ? 'num' : '' }, x)))), dtb))
         : h('div', { class: 'note warn' }, d.device_error || 'The engine reports no GPU devices. Check the graphics driver (Vulkan) or install the ROCm build.'), h('div', { class: 'divider' }), f],
       { icon: 'mem' }),
       group('Optimisation notes for this PC', (d.recommendations || []).map((r) => h('div', { class: 'rec' }, h('b', null, r.title), r.text)), { icon: 'bolt' }));

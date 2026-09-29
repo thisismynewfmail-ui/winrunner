@@ -82,12 +82,12 @@ def fit_args(engine: EngineInfo, plan: Plan, margins: list[int]) -> list[str]:
     return a
 
 
-def context_args(engine: EngineInfo, p: LoadParams, plan: Plan) -> list[str]:
-    a = ["-c", str(plan.ctx)]
-    if p.batch_size != 2048:
-        a += ["-b", str(p.batch_size)]
-    if p.ubatch_size != 512:
-        a += ["-ub", str(p.ubatch_size)]
+def context_args(engine: EngineInfo, p: LoadParams, plan: Plan, with_ctx: bool = True) -> list[str]:
+    a = ["-c", str(plan.ctx)] if with_ctx else []
+    if plan.batch != 2048:
+        a += ["-b", str(plan.batch)]
+    if plan.ubatch != 512:
+        a += ["-ub", str(plan.ubatch)]
     if engine.has("--flash-attn", "-fa"):
         if engine.fa_tristate:
             a += ["-fa", plan.flash_attn]
@@ -229,12 +229,22 @@ def build_server_args(
 
 
 def build_fit_args(engine: EngineInfo, model_path: str, p: LoadParams, plan: Plan, device_names: list[str],
-                   margins: list[int], print_mode: bool) -> list[str] | None:
-    """Arguments for llama-fit-params (engine-side memory projection)."""
+                   margins: list[int], print_mode: bool, auto_ctx: bool = False, n_parallel: int = 0,
+                   min_ctx: int = 4096) -> list[str] | None:
+    """Arguments for llama-fit-params (engine-side memory projection).
+
+    ``auto_ctx`` leaves the context unset so the engine reduces it from the
+    trained length to the largest value that fits (down to ``min_ctx``).
+    ``n_parallel`` mirrors the server's slot count (it sizes sliding-window caches).
+    """
     if not engine.fit_params:
         return None
     a = [engine.fit_params, "-m", model_path]
-    a += [x for x in context_args(engine, p, plan)]
+    a += context_args(engine, p, plan, with_ctx=not auto_ctx)
+    if auto_ctx and engine.has("--fit-ctx", "-fitc"):
+        a += ["--fit-ctx", str(max(256, min_ctx // max(1, n_parallel or 1)))]
+    if n_parallel > 0 and not (plan.parallel and plan.parallel > 0):
+        a += ["-np", str(n_parallel)]
     if plan.use_engine_fit and not print_mode:
         a += gpu_args(engine, p, plan, device_names)
         if engine.has("--fit-target", "-fitt") and margins:
@@ -262,10 +272,10 @@ def build_bench_args(engine: EngineInfo, model_path: str, p: LoadParams, plan: P
     a = [engine.bench, "-m", model_path, "-o", "json", "-r", str(reps), "-p", n_prompt, "-n", n_gen]
     if depth and depth != "0":
         a += ["-d", depth]
-    if p.batch_size != 2048:
-        a += ["-b", str(p.batch_size)]
-    if p.ubatch_size != 512:
-        a += ["-ub", str(p.ubatch_size)]
+    if q.batch != 2048:
+        a += ["-b", str(q.batch)]
+    if q.ubatch != 512:
+        a += ["-ub", str(q.ubatch)]
     a += ["-fa", q.flash_attn if q.flash_attn != "auto" else "on"]
     a += ["-ctk", q.kv_k, "-ctv", q.kv_v]
     if device_names:

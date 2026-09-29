@@ -82,6 +82,7 @@ class EngineDevice:
     total_mib: int
     free_mib: int
     details: str = ""
+    pci: str = ""  # PCI address, learned from the engine's load log ("0000:0b:00.0")
 
 
 @dataclass

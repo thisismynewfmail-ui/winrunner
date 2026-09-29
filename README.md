@@ -151,31 +151,47 @@ print(r.choices[0].message.content)
 
 ## GPU allocation and context length
 
-The default context is **65,536 tokens**. Before every load WinRunner plans memory for the chosen context:
+The default context is **65,536 tokens**. Speed depends above all on the **whole model staying in VRAM**: as soon
+as part of it sits in system RAM, llama.cpp streams those weights over PCIe for every prompt batch, and generation
+runs those layers on the CPU. Prompt processing then gets several times slower, with GPU 0 and the CPU busy while
+the second GPU idles. Before every load WinRunner plans memory for the chosen context:
 
 1. **Context.** The requested length is clamped to the model's trained context unless you tick
    *Allow above trained context*, which uses RoPE scaling.
 2. **KV cache precision.** *Auto* keeps an **F16** cache. It switches to **Q8_0** (near-lossless, half the size)
-   only if that is what allows the entire model plus the full context to stay in VRAM. Q4 is never chosen
-   automatically.
+   only if that is what allows more of the context to stay in VRAM. Q4_0 is never chosen automatically.
 3. **Devices.** Free VRAM of each GPU is read from the engine itself (`llama-server --list-devices`), minus a
-   safety margin (1 GiB per GPU by default; adjustable, also per GPU).
+   safety margin: 1 GiB on a GPU that drives a display or is used by other applications, 512 MiB on a GPU that
+   only WinRunner uses. Both are adjustable, also per GPU (Settings › Hardware).
 4. **Layer split.** Layers are assigned to GPUs in contiguous ranges sized by each layer's real cost:
    weights + KV cache, with the output layer on the last GPU and the vision projector and compute buffers
    accounted for. This mirrors llama.cpp's own assignment (`--tensor-split`).
-5. **If the model does not fit.**
-   - *Mixture-of-experts models:* all attention and KV stay on the GPUs and only the expert weights of the first
-     N layers move to system RAM (`--n-cpu-moe`). This is much faster than moving whole layers.
-   - *Dense models:* the minimum number of layers runs on the CPU.
+5. **If the model does not fit** (load setting *If it does not fit*):
+   - **Reduce context** (default): every layer stays on the GPUs and the context is reduced to the largest value
+     that fits (never below 4,096). The plan, the Activity panel and the engine panel say so, e.g. *Context
+     reduced from 65,536 to 39,936*.
+   - **Offload to CPU:** the full context is kept. For mixture-of-experts models only the expert weights of some
+     layers move to system RAM; for dense models the fewest possible layers run on the CPU. The micro-batch is
+     raised to 2,048 tokens so the CPU-side weights cross PCIe four times less often.
+   - A model that is larger than VRAM even at 4,096 tokens is always partially offloaded.
 6. **Engine verification.** Builds that include `llama-fit-params` (all current releases) verify the plan with
-   llama.cpp's own allocator before loading. In automatic mode the engine's `--fit` then places layers within
-   your safety margins.
+   llama.cpp's own allocator before loading: F16 at the requested context, then Q8_0, then the largest context
+   the engine can fit entirely in VRAM. The server's `--fit` then places the layers within your safety margins.
 
 The **Library › Load** tab shows all of this before you load: per-GPU stacked bars (weights, KV cache, compute
 buffers, vision projector, margin, free), a per-layer placement map, the largest context that still fits entirely
-in VRAM for F16 and Q8_0, and the exact `llama-server` command line.
+in VRAM for F16, Q8_0 and Q4_0, and the exact `llama-server` command line. After loading, the instance view shows
+what the engine actually did: GPU layers, weights left in system RAM, graph splits (about 3 for a full offload
+across two GPUs) and whether pipeline parallelism is active (both GPUs working on a long prompt at once).
 
-*Manual* mode lets you set GPU layers, tensor split, main GPU, split mode and MoE CPU layers yourself.
+*Manual* mode lets you set GPU layers, tensor split, main GPU, split mode and MoE CPU layers yourself. The KV
+cache *Auto* setting and *Reduce context* apply there too, and a manual layout that exceeds free VRAM is reported
+as an error.
+
+**Windows paging.** When allocations exceed free VRAM, Windows does not fail the load: it silently moves part of
+the model into shared system memory. Task Manager then shows dedicated GPU memory stuck below the card's total and
+shared GPU memory rising, and inference crawls. WinRunner compares what the engine allocated with what Windows
+keeps resident and shows a red *VRAM over-committed* warning when it detects this.
 
 ## GGUF settings and chat templates
 
@@ -229,6 +245,8 @@ What WinRunner does by default on this machine, and why:
 | Tensor split | Computed per model | Balances weights + KV per GPU. The display GPU usually has less free VRAM; the plan uses the measured free memory. |
 | Flash attention | Auto | Removes the huge attention scratch buffer at long context (tens of GiB at 64K without it). Required for a quantized V cache. |
 | KV cache | F16 → Q8_0 only if needed | Highest quality that still keeps the whole model in 32 GB of VRAM. |
+| Context | 65,536, reduced if needed | Keeping every layer on the GPUs matters more for speed than the last part of the context. |
+| VRAM margin | 1 GiB display GPU, 512 MiB other GPU | Room for the desktop and applications on the display GPU, without wasting VRAM on the other card. |
 | Loading | Full read when fully offloaded, otherwise mmap | Faster, measurable loads straight into VRAM on Windows. mmap for partial offload avoids a second RAM copy. |
 | Threads | Engine default (6 = physical cores) | With full offload the CPU only schedules work, so SMT threads do not help. |
 | Process priority | Above normal | Keeps token generation smooth while you use the desktop. |
@@ -328,6 +346,8 @@ The whole folder is portable. Set `WINRUNNER_DATA` or `--data-dir` to keep data 
 | "No llama.cpp engine installed" | Settings › Engine › *Check for llama.cpp releases* › Install (Vulkan). |
 | Engine reports no GPUs | Update the Adrenalin driver; *Re-detect engine and devices*. For ROCm builds install the AMD HIP SDK. |
 | Load fails with out-of-memory | Lower the context, set KV cache to Q8_0, or raise the safety margin if other applications use VRAM. The memory plan shows the largest context that fits. |
+| Very slow prompt processing; GPU 0 and CPU busy while GPU 1 idles; VRAM stuck around 13 GB | Part of the model is in system RAM (partial offload) or Windows is paging VRAM. Check the engine panel: it shows *GiB of weights in system RAM* or *VRAM over-committed*. Use automatic allocation with *If it does not fit: Reduce context* (default), a Q8_0/Q4_0 KV cache, or a smaller quantization. |
+| "request exceeds the available context size" | The context was reduced to keep the model in VRAM (see the Activity panel). Use a Q4_0 KV cache or a smaller quantization for more context, or *Offload to CPU* (slower). |
 | Port 5070 already in use | Close the other program (e.g. a second WinRunner) or change the port in Settings › Network (restart required). |
 | Model answers in a strange format | Keep *Template source: GGUF embedded*. Check the Chat Template tab; some old GGUFs have no template and need a built-in one. |
 | Images rejected | The model needs its mmproj file in the same folder (Vision tab). |

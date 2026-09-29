@@ -136,6 +136,14 @@ def dxgi_adapters() -> list[dict[str, Any]]:
                     desc = DXGI_ADAPTER_DESC1()
                     hr = _vcall(adapter, 10, HRESULT, [ctypes.POINTER(DXGI_ADAPTER_DESC1)], ctypes.byref(desc))
                     if hr == 0 and not (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE):
+                        outputs = 0  # monitors attached to this adapter (IDXGIAdapter::EnumOutputs)
+                        while outputs < 16:
+                            output = ctypes.c_void_p()
+                            if _vcall(adapter, 7, HRESULT, [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)], outputs,
+                                      ctypes.byref(output)) != 0:
+                                break
+                            _release(output)
+                            outputs += 1
                         out.append(
                             {
                                 "index": i,
@@ -149,6 +157,7 @@ def dxgi_adapters() -> list[dict[str, Any]]:
                                 "luid": desc.AdapterLuid.key(),
                                 "luid_low": desc.AdapterLuid.LowPart,
                                 "luid_high": desc.AdapterLuid.HighPart,
+                                "outputs": outputs,
                             }
                         )
                 finally:
@@ -265,6 +274,7 @@ class PdhGpuCounters:
         "shared": (r"\GPU Adapter Memory(*)\Shared Usage", PDH_FMT_LARGE),
         "engine": (r"\GPU Engine(*)\Utilization Percentage", PDH_FMT_DOUBLE | PDH_FMT_NOCAP100),
         "proc_dedicated": (r"\GPU Process Memory(*)\Dedicated Usage", PDH_FMT_LARGE),
+        "proc_shared": (r"\GPU Process Memory(*)\Shared Usage", PDH_FMT_LARGE),
     }
     REBUILD_INTERVAL = 30.0  # re-expand wildcards so new processes/engines appear
 
@@ -330,7 +340,7 @@ class PdhGpuCounters:
         return out
 
     def sample(self, watch_pids: set[int] | None = None) -> dict[str, dict[str, Any]]:
-        """Per-LUID: dedicated, shared, util, engines{type:%}, proc_dedicated{pid:bytes}."""
+        """Per-LUID: dedicated, shared, util, engines{type:%}, proc_dedicated / proc_shared {pid: bytes}."""
         if not self.ok:
             return {}
         try:
@@ -343,7 +353,8 @@ class PdhGpuCounters:
 
             def slot(luid: str) -> dict[str, Any]:
                 return res.setdefault(
-                    luid, {"dedicated": 0.0, "shared": 0.0, "engines": {}, "util": 0.0, "proc_dedicated": {}, "proc_util": {}}
+                    luid, {"dedicated": 0.0, "shared": 0.0, "engines": {}, "util": 0.0, "proc_dedicated": {},
+                           "proc_shared": {}, "proc_util": {}}
                 )
 
             def luid_of(inst: str) -> str | None:
@@ -388,8 +399,10 @@ class PdhGpuCounters:
                     s["engines"][et] = max(s["engines"].get(et, 0.0), min(v, 100.0))
                 for lu, s in res.items():
                     s["util"] = max(s["engines"].values()) if s["engines"] else 0.0
-            if watch_pids and "proc_dedicated" in self._counters:
-                for inst, v in self._array(self._counters["proc_dedicated"], self.COUNTERS["proc_dedicated"][1]):
+            for cname in ("proc_dedicated", "proc_shared"):
+                if not watch_pids or cname not in self._counters:
+                    continue
+                for inst, v in self._array(self._counters[cname], self.COUNTERS[cname][1]):
                     low = inst.lower()
                     if not low.startswith("pid_"):
                         continue
@@ -399,7 +412,7 @@ class PdhGpuCounters:
                         continue
                     lu = luid_of(inst)
                     if lu and pid in watch_pids:
-                        pd = slot(lu)["proc_dedicated"]
+                        pd = slot(lu)[cname]
                         pd[pid] = pd.get(pid, 0.0) + v
             return res
         except Exception:

@@ -25,7 +25,7 @@ from .events import BusLogHandler, EventBus, RequestTracker
 from .hardware import HardwareMonitor
 from .library import ModelLibrary
 from .manager import ModelManager
-from .paths import STATIC_DIR, DataPaths
+from .paths import IS_WINDOWS, STATIC_DIR, DataPaths
 from .util import GiB, is_loopback
 
 log = logging.getLogger("winrunner.app")
@@ -117,15 +117,25 @@ def recommendations(sysinfo: dict[str, Any]) -> list[dict[str, str]]:
     ram = sysinfo.get("ram_total") or 0
     if ram >= 48 * GiB:
         out.append({"title": "System memory",
-                    "text": f"{ram / GiB:.0f} GiB RAM: large mixture-of-experts models that exceed VRAM keep expert "
-                            "weights in system RAM automatically while attention and KV cache stay on the GPUs. "
-                            "The prompt cache (8 GiB default) keeps recent conversations for instant reuse."})
+                    "text": f"{ram / GiB:.0f} GiB RAM: models larger than VRAM can still run with part of the weights "
+                            "in system RAM (for mixture-of-experts models only the expert weights). That is several "
+                            "times slower, because every prompt batch streams those weights over PCIe. The prompt "
+                            "cache (8 GiB default) keeps recent conversations for instant reuse."})
     total_vram = sum(g.get("vram_total") or 0 for g in gpus)
     if total_vram:
         out.append({"title": "Context length and KV cache",
-                    "text": f"{total_vram / GiB:.0f} GiB total VRAM. WinRunner keeps the KV cache at F16 when the "
-                            "requested context fits and switches to Q8_0 (near-lossless, half the size) only when that "
-                            "is what allows the whole model to stay on the GPUs."})
+                    "text": f"{total_vram / GiB:.0f} GiB total VRAM. Speed depends on the whole model staying in VRAM. "
+                            "WinRunner keeps the KV cache at F16 when the requested context fits, switches to Q8_0 "
+                            "(near-lossless, half the size) when that makes it fit, and otherwise reduces the context "
+                            "to the largest that fits (load setting 'If it does not fit'). The memory plan shows the "
+                            "largest full-offload context for each KV cache type."})
+        if IS_WINDOWS:
+            out.append({"title": "Never over-commit VRAM on Windows",
+                        "text": "When allocations exceed free VRAM, Windows does not fail the load: it silently pages "
+                                "part of the model into shared system memory, and the GPUs stall on PCIe transfers "
+                                "(Task Manager shows dedicated GPU memory stuck below the total and shared memory "
+                                "rising). WinRunner keeps a safety margin per GPU (larger on the GPU driving the "
+                                "display) and warns in the Activity panel if it detects paging."})
     return out
 
 
@@ -138,6 +148,7 @@ def create_app(paths: DataPaths, window_mode: bool = False) -> tuple[FastAPI, Ap
     bus = EventBus()
     tracker = RequestTracker(bus, store.settings.server.request_history)
     manager = ModelManager(store, paths, library, engines, monitor, bus, tracker)
+    tracker.on_error = manager.note_request_error
     http = httpx.AsyncClient(headers={"User-Agent": f"{PRODUCT_NAME}/{__version__}"})
     ctx = AppContext(paths=paths, store=store, library=library, engines=engines, monitor=monitor, bus=bus,
                      tracker=tracker, manager=manager, http=http)
@@ -156,6 +167,8 @@ def create_app(paths: DataPaths, window_mode: bool = False) -> tuple[FastAPI, Ap
         def on_sample(s: dict) -> None:
             ctx.metrics_history.append(s)
             bus.publish("metrics", sample=s)
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(manager.check_residency, s)
 
         monitor.subscribe(on_sample)
         monitor.start()

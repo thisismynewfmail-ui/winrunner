@@ -85,6 +85,8 @@ def test_jit_chat_stream_and_aggregate(server):
     assert not any("prompt_progress" in ln for ln in lines)
     inst = ctx.manager.instance_for_model(mid)
     assert inst.template_verified is True  # engine uses the GGUF's embedded template
+    pl = inst.load_info["placement"]  # derived from the engine's load log
+    assert pl["total_layers"] and pl["graph_splits"] >= 1 and pl["gpu_devices"] == []  # CPU engine: no GPU buffers
     lms = httpx.post(base + "/api/v0/chat/completions", json=body, timeout=120).json()
     assert lms["stats"]["tokens_per_second"] > 0 and lms["model_info"]["format"] == "gguf"
 

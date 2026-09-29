@@ -41,9 +41,21 @@ class GpuInfo:
     adl_index: int | None = None
     sysfs: dict[str, Any] = field(default_factory=dict)
     nvidia_index: int | None = None
+    display: bool | None = None  # drives a monitor (None = unknown)
 
 
 _VENDORS = {0x1002: "AMD", 0x10DE: "NVIDIA", 0x8086: "Intel", 0x1414: "Microsoft"}
+
+
+def _pci_bus(addr: str) -> int | None:
+    """Bus number from a PCI address such as '0000:0b:00.0'."""
+    parts = (addr or "").split(":")
+    if len(parts) < 3:
+        return None
+    try:
+        return int(parts[-2], 16)
+    except ValueError:
+        return None
 
 
 def _norm_name(s: str) -> str:
@@ -107,6 +119,7 @@ class HardwareMonitor:
                 bus=bus,
                 driver=drivers.get(a["name"], ""),
                 luid=a["luid"],
+                display=bool(a.get("outputs", 0)) if "outputs" in a else None,
             )
             out.append(g)
         if self._adl and self._adl.ok:
@@ -164,27 +177,98 @@ class HardwareMonitor:
     # ----- engine device mapping ---------------------------------------------
 
     def map_engine_devices(self, devices: list[dict[str, Any]]) -> dict[str, str]:
-        """Map engine device names (Vulkan0, ROCm1 ...) to gpu ids.
+        """Map engine device names (Vulkan0, ROCm1 ...) to gpu ids."""
+        return self._match_devices(devices)[0]
 
-        Devices are matched by name, and in order among identically named
-        devices (engines enumerate in PCI order, matching our bus sort).
+    def _match_devices(self, devices: list[dict[str, Any]]) -> tuple[dict[str, str], set[str]]:
+        """(engine device -> gpu id, names whose match is certain).
+
+        1. PCI address (learned from the engine's load log) against the adapter's bus number.
+        2. Unique model name.
+        3. Identical cards: the engine device with the most free memory is paired with the
+           card that has no display and the least VRAM in use. The pairing is only
+           trusted when the free-memory difference is clear (a display costs >=192 MiB)
+           and no WinRunner engine is loaded (its own allocations would dominate).
         """
         mapping: dict[str, str] = {}
+        certain: set[str] = set()
         pool = list(self.gpus)
         for d in devices:
+            bus = _pci_bus(d.get("pci", ""))
+            g = next((g for g in pool if bus is not None and g.bus == bus), None)
+            if g is not None:
+                mapping[d["name"]] = g.id
+                certain.add(d["name"])
+                pool.remove(g)
+        rest = [d for d in devices if d["name"] not in mapping]
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for d in rest:
             desc = _norm_name(d.get("description", ""))
-            best = None
-            for g in pool:
-                gn = _norm_name(g.name)
-                if gn and (gn in desc or desc in gn):
-                    best = g
-                    break
-            if best is None and pool:
-                best = pool[0]
-            if best is not None:
-                mapping[d["name"]] = best.id
-                pool.remove(best)
-        return mapping
+            exact = next((g.id for g in pool if _norm_name(g.name) == desc), "")
+            key = exact or next((g.id for g in pool if _norm_name(g.name) and
+                                 (_norm_name(g.name) in desc or desc in _norm_name(g.name))), "")
+            groups.setdefault(key, []).append(d)
+        used = {r.get("id"): r.get("vram_used") or 0 for r in (self.last.get("gpus") or [])}
+        for key, devs in groups.items():
+            first = next((g for g in pool if g.id == key), None)
+            if first is None:
+                continue
+            name = _norm_name(first.name)
+            cands = [g for g in pool if _norm_name(g.name) == name]
+            if not cands:
+                continue
+            if len(devs) == 1 and len(cands) == 1:
+                mapping[devs[0]["name"]] = cands[0].id
+                certain.add(devs[0]["name"])
+                pool.remove(cands[0])
+                continue
+            by_free = sorted(devs, key=lambda d: -(d.get("free_mib") or 0))
+            by_idle = sorted(cands, key=lambda g: (bool(g.display), used.get(g.id, 0), g.bus if g.bus is not None else 999))
+            frees = [d.get("free_mib") or 0 for d in by_free]
+            gap = min((a - b for a, b in zip(frees, frees[1:])), default=0)
+            shows = [g.display for g in cands]
+            # free memory only identifies the display card while no WinRunner engine holds VRAM
+            idle_engines = not getattr(self, "_watch", None)
+            sure = (None not in shows and sum(1 for x in shows if x) == 1 and gap >= 192 and len(devs) == len(cands)
+                    and idle_engines)
+            for d, g in zip(by_free, by_idle):
+                mapping[d["name"]] = g.id
+                if sure:
+                    certain.add(d["name"])
+                pool.remove(g)
+        for d in devices:  # anything left: enumeration order
+            if d["name"] not in mapping and pool:
+                mapping[d["name"]] = pool.pop(0).id
+        return mapping, certain
+
+    def device_roles(self, devices: list[dict[str, Any]]) -> dict[str, str]:
+        """Per engine device: "display" (drives a monitor), "busy" (other applications use
+        >400 MiB of it), "idle" (only WinRunner uses it) or "unknown"."""
+        mapping, certain = self._match_devices(devices)
+        by_id = {g.id: g for g in self.gpus}
+        used = {r.get("id"): r.get("vram_used") for r in (self.last.get("gpus") or [])}
+        own: dict[str, float] = {}
+        for rec in (self.last.get("procs") or {}).values():
+            for gid, v in (rec.get("vram") or {}).items():
+                own[gid] = own.get(gid, 0.0) + float(v or 0)
+        roles: dict[str, str] = {}
+        for d in devices:
+            g = by_id.get(mapping.get(d["name"], ""))
+            if g is None:
+                roles[d["name"]] = "unknown"
+                continue
+            # an uncertain pairing among identical cards still has a known role if none of them drives a display
+            group = [g] if d["name"] in certain else [x for x in self.gpus if _norm_name(x.name) == _norm_name(g.name)]
+            if any(x.display is None for x in group) or (len(group) > 1 and any(x.display for x in group)):
+                roles[d["name"]] = "unknown"
+            elif g.display:
+                roles[d["name"]] = "display"
+            elif any(used.get(x.id) is None for x in group):
+                roles[d["name"]] = "unknown"
+            else:
+                other = max(float(used[x.id] or 0) - own.get(x.id, 0.0) for x in group)
+                roles[d["name"]] = "idle" if other < 400 * 1024 * 1024 else "busy"
+        return roles
 
     # ----- process watch -------------------------------------------------------
 
@@ -260,10 +344,14 @@ class HardwareMonitor:
                 self.unwatch_process(pid)
         for g in data["gpus"]:
             pv = g.pop("_proc_vram", {})
+            ps = g.pop("_proc_shared", {})
             pu = g.pop("_proc_util", {})
             for pid, v in pv.items():
                 if str(pid) in data["procs"]:
                     data["procs"][str(pid)].setdefault("vram", {})[g["id"]] = v
+            for pid, v in ps.items():
+                if str(pid) in data["procs"]:
+                    data["procs"][str(pid)].setdefault("shared", {})[g["id"]] = v
             for pid, v in pu.items():
                 if str(pid) in data["procs"]:
                     data["procs"][str(pid)].setdefault("gpu_util", {})[g["id"]] = v
@@ -283,6 +371,7 @@ class HardwareMonitor:
                     rec["util"] = round(c["util"], 1)
                     rec["engines"] = {k: round(v, 1) for k, v in c["engines"].items() if v > 0.05}
                     rec["_proc_vram"] = c.get("proc_dedicated", {})
+                    rec["_proc_shared"] = c.get("proc_shared", {})
                     rec["_proc_util"] = c.get("proc_util", {})
                 if self._adl and g.adl_index is not None:
                     s = self._adl.read(g.adl_index)

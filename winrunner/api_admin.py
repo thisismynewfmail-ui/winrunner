@@ -348,6 +348,8 @@ def build_router(ctx: AppContext) -> APIRouter:
         return {"system": ctx.extras.get("sysinfo"), "sample": ctx.monitor.last,
                 "engine_devices": [d.__dict__ for d in devices], "device_error": err,
                 "device_map": ctx.manager.device_map(devices),
+                "device_roles": ctx.manager.device_roles(devices),
+                "device_margins": ctx.manager._margin_map(devices),
                 "recommendations": ctx.extras.get("recommendations", [])}
 
     @r.get("/api/engine")

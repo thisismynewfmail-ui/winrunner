@@ -8,6 +8,27 @@ import { group, meter } from './ui.js';
 import { engineState } from './state.js';
 import { layerMap } from './memviz.js';
 
+/** Short placement warnings for a loaded instance: [level, text, tooltip]. */
+export function placementNotes(inst) {
+  const li = inst.load || {};
+  const p = inst.plan || {};
+  const out = [];
+  if (li.vram_spill_active) {
+    out.push(['err', `VRAM over-committed: ~${(li.vram_spill_mib / 1024).toFixed(1)} GiB paged to system RAM`,
+      'Windows moved part of the model out of VRAM, so the GPUs wait on PCIe transfers. Reload with automatic allocation and "Reduce context", or free VRAM.']);
+  }
+  const pl = li.placement;
+  if (pl?.partial && pl.gpu_devices?.length) {
+    out.push(['warn', `${(pl.cpu_weights_mib / 1024).toFixed(1)} GiB of weights in system RAM · slow prompt processing`,
+      'Part of the model did not fit in VRAM. Every prompt batch streams these weights over PCIe. Choose "Reduce context" in the load settings to keep the whole model on the GPUs.']);
+  }
+  if (p.ctx_reduced_from && inst.state === 'ready') {
+    out.push(['info', `Context reduced from ${fmt.num(p.ctx_reduced_from)} to keep the model in VRAM`,
+      'Set "If it does not fit" to "Offload to CPU" in the load settings to keep the full context (slower).']);
+  }
+  return out;
+}
+
 export function mountSidebar(root) {
   // ---- ENGINE ----------------------------------------------------------------
   const eLed = h('span', { class: 'led big' });
@@ -18,10 +39,11 @@ export function mountSidebar(root) {
   const eProg = h('div', { class: 'progress' }, h('div', { class: 'fill' }));
   const eProgLbl = h('div', { class: 'eng-phase dim' });
   const eLoadBox = h('div', { class: 'eng-load hidden' }, eProg, eProgLbl);
+  const eWarn = h('div', { class: 'eng-warn' });
   const lmap = layerMap();
   const engine = group('Engine', [
     h('div', { class: 'eng-top' }, eLed, eState, h('span', { class: 'spacer' }), eUp),
-    eModel, eMeta, eLoadBox, lmap,
+    eModel, eMeta, eLoadBox, eWarn, lmap,
   ], { icon: 'chip' });
 
   // ---- PIPELINE ----------------------------------------------------------------
@@ -84,6 +106,8 @@ export function mountSidebar(root) {
       const e = store.status?.engine;
       setText(eMeta, e ? `llama.cpp ${e.build ? `b${e.build}` : e.version} · ${e.backend_label || e.backend}` : 'Settings › Engine › Download');
       eLoadBox.classList.add('hidden');
+      clear(eWarn);
+      eWarn.dataset.sig = '';
       lmap.update(null);
       setText(eUp, '');
       return;
@@ -110,6 +134,13 @@ export function mountSidebar(root) {
     }
     setText(eUp, inst.state === 'ready' && inst.t_ready ? fmt.uptime(store.now() - inst.t_ready) : inst.state);
     lmap.update(p, { progress: inst.progress, loading, loadInfo: loading ? null : li });
+    const notes = placementNotes(inst);
+    const sig = notes.map((n) => n[1]).join('|');
+    if (sig !== eWarn.dataset.sig) {
+      eWarn.dataset.sig = sig;
+      clear(eWarn);
+      eWarn.append(...notes.map(([lvl, text, tip]) => h('div', { class: `note ${lvl}`, 'data-tip': tip || '' }, text)));
+    }
   }
 
   function focusReq() {

@@ -143,6 +143,7 @@ class RequestTracker:
         self._last_progress_emit: dict[str, float] = {}
         self._flusher: asyncio.Task | None = None
         self.tps_history: deque[dict[str, Any]] = deque(maxlen=300)
+        self.on_error: Any = None  # callable(record, error text), set by the app
 
     def start(self) -> None:
         if self._flusher is None:
@@ -229,6 +230,11 @@ class RequestTracker:
         r.finish_reason = finish_reason or r.finish_reason
         r.error = error
         r.phase = "cancelled" if cancelled else "error" if error else "done"
+        if error and self.on_error is not None:
+            try:
+                self.on_error(r, error)
+            except Exception:  # diagnostics must never break request bookkeeping
+                log.debug("request error hook failed", exc_info=True)
         with self._lock:
             self.active.pop(r.id, None)
             self.history.appendleft(r)

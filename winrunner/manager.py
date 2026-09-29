@@ -13,19 +13,23 @@ from pathlib import Path
 from typing import Any
 
 from .cmdline import build_fit_args, build_server_args
-from .config import LoadParams, SettingsStore
+from .config import QUANTIZED_KV, LoadParams, SettingsStore
 from .engine import EngineDevice, EngineInfo, EngineManager
 from .events import EventBus, RequestTracker
 from .hardware import HardwareMonitor
-from .instance import EngineInstance
+from .instance import EngineInstance, is_host_buffer
 from .library import ModelEntry, ModelLibrary
 from .paths import IS_WINDOWS, DataPaths
-from .planner import Plan, Planner, parse_fit_args, parse_fit_print
+from .planner import (AUTO_UBATCH, MIN_FIT_CTX, PLACEMENT_PREFIXES, Plan, Planner, floor_ctx, msg_ctx_reduced,
+                      msg_kv_q8, msg_manual_over, msg_no_fit_min, msg_partial_experts, msg_partial_layers, msg_ubatch,
+                      override_layers, parse_fit_args, parse_fit_print)
 from .util import free_port, new_id
 
 log = logging.getLogger("winrunner.manager")
 
 _CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
+MiB = 1024 * 1024
+PLAN_CACHE_TTL = 1800.0  # engine projections stay valid while free VRAM (256 MiB buckets) is unchanged
 
 
 class ModelError(Exception):
@@ -52,6 +56,8 @@ class ModelManager:
         self._tasks: list[asyncio.Task] = []
         self._restart_log: list[float] = []
         self._plan_cache: dict[str, tuple[float, dict]] = {}
+        self._device_pci: dict[str, dict[str, str]] = {}  # engine path -> device name -> PCI address (from load logs)
+        self._spill: dict[str, dict[str, Any]] = {}  # instance id -> VRAM residency state
         self._shutting_down = False
         self.exiting: Any = lambda: False  # set by the entry point: True once the server is stopping
         self.ui_clients = 0
@@ -75,10 +81,23 @@ class ModelManager:
         eng = await self.engine_async()
         if eng is None:
             return [], "no engine installed"
-        return await asyncio.to_thread(self.engines.list_devices, Path(eng.path), max_age)
+        devs, err = await asyncio.to_thread(self.engines.list_devices, Path(eng.path), max_age)
+        pci = self._device_pci.get(eng.path, {})
+        for d in devs:
+            d.pci = pci.get(d.name, d.pci)
+        return devs, err
+
+    @staticmethod
+    def _dev_dicts(devices: list[EngineDevice]) -> list[dict[str, Any]]:
+        return [{"name": d.name, "description": d.description, "pci": d.pci, "free_mib": d.free_mib,
+                 "total_mib": d.total_mib} for d in devices]
 
     def device_map(self, devices: list[EngineDevice]) -> dict[str, str]:
-        return self.monitor.map_engine_devices([{"name": d.name, "description": d.description} for d in devices])
+        return self.monitor.map_engine_devices(self._dev_dicts(devices))
+
+    def device_roles(self, devices: list[EngineDevice]) -> dict[str, str]:
+        """display | idle | busy | unknown per engine device (decides the VRAM safety margin)."""
+        return self.monitor.device_roles(self._dev_dicts(devices))
 
     # ----- lifecycle helpers ------------------------------------------------------------
 
@@ -116,10 +135,24 @@ class ModelManager:
             return None
         return self.library.get(p.draft_model) or self.library.resolve(p.draft_model)
 
-    def _margins(self, devices: list[EngineDevice], p: LoadParams) -> list[int]:
+    def _margin_map(self, devices: list[EngineDevice]) -> dict[str, int]:
+        """VRAM left free per device: the full margin on GPUs that drive a display or run other
+        applications (their usage can grow at any time), a smaller one on GPUs only WinRunner uses."""
         hw = self.store.settings.hardware
-        sel = [d for d in devices if not p.devices or d.name in p.devices]
-        return [int(hw.vram_margin_per_device.get(d.name, hw.vram_margin_mib)) for d in sel]
+        roles = self.device_roles(devices)
+        out: dict[str, int] = {}
+        for d in devices:
+            if d.name in hw.vram_margin_per_device:
+                out[d.name] = int(hw.vram_margin_per_device[d.name])
+            elif roles.get(d.name) == "idle":
+                out[d.name] = int(hw.vram_margin_idle_mib)
+            else:
+                out[d.name] = int(hw.vram_margin_mib)
+        return out
+
+    def _margins(self, devices: list[EngineDevice], p: LoadParams) -> list[int]:
+        mm = self._margin_map(devices)
+        return [mm[d.name] for d in devices if not p.devices or d.name in p.devices]
 
     def _reclaim(self, evicting: list[EngineInstance]) -> dict[str, float]:
         """VRAM that loaded instances would free if they are evicted."""
@@ -139,7 +172,7 @@ class ModelManager:
         return [i for i in self.instances.values() if i.model_id != model_id and i.state in ("ready", "loading")]
 
     async def plan(self, model_id: str, overrides: dict | None = None, verify: bool = False,
-                   assume_evict: bool = True) -> tuple[Plan, dict[str, Any]]:
+                   assume_evict: bool = True, projection: bool = True) -> tuple[Plan, dict[str, Any]]:
         entry = self.library.get(model_id) or self.library.resolve(model_id)
         if entry is None:
             raise ModelError(f"model '{model_id}' not found in library", 404, "model_not_found")
@@ -160,7 +193,7 @@ class ModelManager:
         planner = Planner(
             entry.info, p, devices, self.device_map(devices),
             margin_mib=self.store.settings.hardware.vram_margin_mib,
-            margin_per_device=self.store.settings.hardware.vram_margin_per_device,
+            margin_per_device=self._margin_map(devices),
             reclaim_mib=self._reclaim(evicting),
             mmproj_size=mm_size, mmproj_mib_hint=mm_hint,
             draft_info=draft.info if draft else None,
@@ -176,6 +209,7 @@ class ModelManager:
         extra = {
             "entry": entry.to_summary(),
             "devices": [d.__dict__ for d in devices],
+            "device_roles": self.device_roles(devices),
             "device_error": dev_err,
             "engine": eng.to_dict() if eng else None,
             "evicting": [i.model_id for i in evicting],
@@ -183,7 +217,7 @@ class ModelManager:
         }
         if verify and eng and eng.fit_params and devices and not evicting:
             try:
-                await self._verify_with_engine(eng, entry, p, pl, devices)
+                await self._verify_with_engine(eng, entry, p, pl, devices, projection=projection)
             except Exception as exc:  # projection is advisory; never block a load on it
                 pl.warnings.append(f"Engine memory projection failed: {exc}")
         elif verify and evicting:
@@ -206,79 +240,201 @@ class ModelManager:
         return pl, extra
 
     async def _verify_with_engine(self, eng: EngineInfo, entry: ModelEntry, p: LoadParams, pl: Plan,
-                                  devices: list[EngineDevice]) -> None:
+                                  devices: list[EngineDevice], projection: bool = True) -> None:
+        """Check (and correct) the plan with llama.cpp's own memory model (llama-fit-params).
+
+        Automatic allocation: F16 KV at the requested context, then Q8_0; if the model
+        still does not fit entirely in VRAM and the overflow policy is "reduce context",
+        the engine is asked for the largest context at which everything fits. Manual
+        allocation: the engine projects the exact configuration; with "reduce context"
+        the context is shrunk until that projection fits.
+        """
         sel = [d.name for d in devices if not p.devices or d.name in p.devices]
         margins = self._margins(devices, p)
         if pl.mmproj and margins and p.mmproj_offload:
             margins = [margins[0] + int(pl.totals.get("mmproj_mib", 0))] + margins[1:]
-        key_src = json.dumps([entry.path, entry.info.mtime, p.model_dump(mode="json"), pl.ctx, pl.kv_k,
-                              [(d.name, d.free_mib // 256) for d in devices], eng.path], sort_keys=True)
+        ctx_req = pl.ctx_reduced_from or pl.ctx
+        key_src = json.dumps([entry.path, entry.info.mtime, p.model_dump(mode="json"), ctx_req, pl.mode, margins,
+                              [(d.name, d.free_mib // 256) for d in devices], eng.path, projection], sort_keys=True)
         key = hashlib.sha1(key_src.encode()).hexdigest()
         cached = self._plan_cache.get(key)
-        if cached and time.time() - cached[0] < 120:
-            self._apply_projection(pl, cached[1], devices)
+        if cached and time.time() - cached[0] < PLAN_CACHE_TTL:
+            self._apply_projection(pl, cached[1], entry, p, devices)
             return
-        candidates = [pl.kv_k]
-        if p.kv_cache_type == "auto":
-            candidates = ["f16", "q8_0"] if p.flash_attn != "off" else ["f16"]
-        chosen: dict[str, Any] | None = None
-        for kv in candidates:
-            q = Plan(**{**pl.__dict__})
-            q.kv_k = q.kv_v = kv if p.kv_cache_type == "auto" else pl.kv_k
-            if p.kv_cache_type != "auto":
-                q.kv_v = pl.kv_v
-            if kv != "f16" and q.flash_attn == "auto":
-                q.flash_attn = "on"
-            q.use_engine_fit = True
-            args = build_fit_args(eng, entry.path, p, q, sel, margins, print_mode=False)
-            if not args:
-                return
-            rc, out = await asyncio.to_thread(_run_capture, args, 120)
-            fit = parse_fit_args(out)
-            if rc != 0 or not fit:
-                raise RuntimeError(f"llama-fit-params failed ({rc}): {out.strip().splitlines()[-1] if out.strip() else ''}")
-            ngl = fit.get("ngl", -1)
-            full = (ngl < 0 or ngl >= entry.info.n_layer) and "override_tensor" not in fit
-            chosen = {"kv_k": q.kv_k, "kv_v": q.kv_v, "flash_attn": q.flash_attn, "fit": fit, "full": full}
-            if full:
-                break
+        n_par = (p.parallel if p.parallel > 0 else 4) if entry.info.sliding_window else 0
+        if pl.mode == "manual":
+            chosen = await self._project_manual(eng, entry, p, pl, sel, margins, n_par, devices, ctx_req)
+        else:
+            chosen = await self._fit_auto(eng, entry, p, pl, sel, margins, n_par, ctx_req)
+            if chosen is not None and projection:
+                chosen["projection"] = await self._fit_projection(eng, entry, p, pl, sel, n_par, chosen)
         if chosen is None:
             return
+        self._plan_cache[key] = (time.time(), chosen)
+        self._apply_projection(pl, chosen, entry, p, devices)
+
+    async def _fit_auto(self, eng: EngineInfo, entry: ModelEntry, p: LoadParams, pl: Plan, sel: list[str],
+                        margins: list[int], n_par: int, ctx_req: int) -> dict[str, Any] | None:
+        info = entry.info
+        if p.kv_cache_type == "auto":
+            kvs = ["f16", "q8_0"] if p.flash_attn != "off" else ["f16"]
+        else:
+            kvs = [p.kv_cache_type]
+
+        async def run(kv: str, ctx: int | None, ub: int) -> dict[str, Any]:
+            q = Plan(**{**pl.__dict__})
+            q.kv_k, q.kv_v = kv, p.kv_cache_type_v or kv
+            quant = q.kv_k in QUANTIZED_KV or q.kv_v in QUANTIZED_KV
+            q.flash_attn = "on" if quant and p.flash_attn == "auto" else pl.flash_attn if quant else p.flash_attn
+            q.ctx = ctx or ctx_req
+            q.ubatch, q.batch = ub, max(p.batch_size, ub)
+            q.use_engine_fit = True
+            args = build_fit_args(eng, entry.path, p, q, sel, margins, print_mode=False, auto_ctx=ctx is None,
+                                  n_parallel=n_par, min_ctx=MIN_FIT_CTX)
+            if not args:
+                raise RuntimeError("llama-fit-params is not available")
+            rc, out = await asyncio.to_thread(_run_capture, args, 180)
+            fit = parse_fit_args(out)
+            if rc != 0 or not fit:
+                tail = out.strip().splitlines()[-1] if out.strip() else ""
+                raise RuntimeError(f"llama-fit-params failed ({rc}): {tail}")
+            ngl = fit.get("ngl", -1)
+            full = (ngl < 0 or ngl > info.n_layer) and "override_tensor" not in fit
+            got = q.ctx if ctx else min(ctx_req, int(fit.get("ctx") or ctx_req))
+            return {"kv_k": q.kv_k, "kv_v": q.kv_v, "flash_attn": q.flash_attn, "fit": fit, "full": full,
+                    "ctx": got, "ctx_requested": ctx_req, "ubatch": q.ubatch, "batch": q.batch}
+
+        reduce = p.vram_overflow == "reduce_context"
+        boost = p.auto_batch and p.ubatch_size < AUTO_UBATCH
+        est = pl.max_ctx_full_offload or {}
+
+        def hopeless(kv: str) -> bool:
+            # each engine run costs seconds; skip configurations the estimate misses by a wide margin
+            return kv in est and est[kv] < 0.85 * ctx_req
+
+        chosen: dict[str, Any] | None = None
+        for i, kv in enumerate(kvs):
+            last = i == len(kvs) - 1
+            if hopeless(kv) and (not last or reduce or boost):
+                continue
+            chosen = await run(kv, ctx_req, p.ubatch_size)
+            if chosen["full"]:
+                return chosen
+        if reduce:
+            r = await run(kvs[-1], None, p.ubatch_size)
+            if r["full"] and r["ctx"] >= min(MIN_FIT_CTX, ctx_req):
+                r["ctx"] = min(ctx_req, floor_ctx(r["ctx"]))
+                return r
+        if boost:
+            # partial offload: fit with the larger micro-batch the server will be started with
+            return await run(kvs[-1], ctx_req, AUTO_UBATCH)
+        return chosen or await run(kvs[-1], ctx_req, p.ubatch_size)
+
+    async def _fit_projection(self, eng: EngineInfo, entry: ModelEntry, p: LoadParams, pl: Plan, sel: list[str],
+                              n_par: int, chosen: dict[str, Any]) -> dict[str, dict[str, float]]:
+        """Per-device memory the engine projects for the chosen configuration (llama-fit-params --fit-print)."""
         q = Plan(**{**pl.__dict__})
         q.kv_k, q.kv_v, q.flash_attn = chosen["kv_k"], chosen["kv_v"], chosen["flash_attn"]
-        fit = chosen["fit"]
+        q.ctx, q.ubatch, q.batch = chosen["ctx"], chosen["ubatch"], chosen["batch"]
+        fit = chosen.get("fit") or {}
         ngl = fit.get("ngl", -1)
         q.gpu_layers = entry.info.n_layer + 1 if ngl < 0 else ngl
         q.tensor_split = fit.get("tensor_split") or pl.tensor_split
         q.n_cpu_moe = 0
         q.use_engine_fit = False
-        pargs = build_fit_args(eng, entry.path, p, q, sel, margins, print_mode=True)
-        if fit.get("override_tensor") and pargs:
+        pargs = build_fit_args(eng, entry.path, p, q, sel, [], print_mode=True, n_parallel=n_par)
+        if not pargs:
+            return {}
+        if fit.get("override_tensor"):
             pargs += ["-ot", fit["override_tensor"]]
-        proj: dict[str, Any] = {}
-        if pargs:
+        rc, out = await asyncio.to_thread(_run_capture, pargs, 120)
+        return parse_fit_print(out) if rc == 0 else {}
+
+    async def _project_manual(self, eng: EngineInfo, entry: ModelEntry, p: LoadParams, pl: Plan, sel: list[str],
+                              margins: list[int], n_par: int, devices: list[EngineDevice],
+                              ctx_req: int) -> dict[str, Any] | None:
+        """Engine projection of an explicit (manual) layout; shrinks the context if it overflows."""
+        free = {d.name: d.free_mib for d in devices}
+        marg = dict(zip(sel, margins))
+
+        async def project(ctx: int) -> dict[str, dict[str, float]]:
+            q = Plan(**{**pl.__dict__})
+            q.ctx = ctx
+            q.use_engine_fit = False
+            pargs = build_fit_args(eng, entry.path, p, q, sel, [], print_mode=True, n_parallel=n_par)
+            if not pargs:
+                return {}
             rc, out = await asyncio.to_thread(_run_capture, pargs, 120)
-            if rc == 0:
-                proj = parse_fit_print(out)
-        chosen["projection"] = proj
-        self._plan_cache[key] = (time.time(), chosen)
-        self._apply_projection(pl, chosen, devices)
+            return parse_fit_print(out) if rc == 0 else {}
+
+        def overflow(proj: dict[str, dict[str, float]]) -> dict[str, float]:
+            return {n: v["model"] + v["context"] + v["compute"] - (free.get(n, 0) - marg.get(n, 0))
+                    for n, v in proj.items() if n in free}
+
+        ctx = pl.ctx
+        proj = await project(ctx)
+        if not proj:
+            return None
+        over = overflow(proj)
+        if any(x > 0 for x in over.values()) and p.vram_overflow == "reduce_context":
+            # the KV cache and attention buffers scale with the context: shrink it by the worst overflow ratio
+            ratios = [1 - x / proj[n]["context"] for n, x in over.items() if x > 0 and proj[n]["context"] > 0]
+            if ratios and min(ratios) > 0:
+                new = floor_ctx(int(ctx * min(ratios) * 0.97))
+                if new >= min(MIN_FIT_CTX, ctx_req) and new < ctx:
+                    proj2 = await project(new)
+                    if proj2 and all(x <= 0 for x in overflow(proj2).values()):
+                        ctx, proj = new, proj2
+        return {"kv_k": pl.kv_k, "kv_v": pl.kv_v, "flash_attn": pl.flash_attn, "fit": {}, "full": pl.full_offload,
+                "ctx": ctx, "ctx_requested": ctx_req, "ubatch": pl.ubatch, "batch": pl.batch, "projection": proj,
+                "manual": True}
 
     @staticmethod
-    def _apply_projection(pl: Plan, chosen: dict[str, Any], devices: list[EngineDevice]) -> None:
-        was_kv = pl.kv_k
+    def _apply_projection(pl: Plan, chosen: dict[str, Any], entry: ModelEntry, p: LoadParams,
+                          devices: list[EngineDevice]) -> None:
+        info = entry.info
+        reduce = p.vram_overflow == "reduce_context"
+        manual = bool(chosen.get("manual"))
+        pl.source = "engine"
         pl.kv_k, pl.kv_v = chosen["kv_k"], chosen["kv_v"]
         pl.flash_attn = chosen["flash_attn"]
-        pl.full_offload = bool(chosen["full"])
-        pl.source = "engine"
+        req = int(chosen.get("ctx_requested") or pl.ctx)
+        pl.ctx = int(chosen["ctx"])
+        pl.ctx_reduced_from = req if pl.ctx < req else 0
+        pl.ubatch, pl.batch = int(chosen["ubatch"]), int(chosen["batch"])
+        fit = chosen.get("fit") or {}
         proj = chosen.get("projection") or {}
-        pl.engine = {"fit": chosen["fit"], "projection": proj, "full_offload": chosen["full"]}
-        if was_kv != pl.kv_k:
-            pl.notes = [n for n in pl.notes if "KV cache set to" not in n]
-            if pl.kv_k != "f16":
-                pl.notes.append("Engine projection: KV cache Q8_0 needed for a full GPU offload.")
-            else:
-                pl.notes.append("Engine projection: full F16 KV cache fits in VRAM.")
+        pl.engine = {"fit": fit, "projection": proj, "full_offload": chosen["full"]}
+        pl.warnings = [w for w in pl.warnings if not w.startswith(PLACEMENT_PREFIXES + ("Manual allocation",))]
+        pl.notes = [n for n in pl.notes if not n.startswith(PLACEMENT_PREFIXES)]
+        if pl.ctx_reduced_from:
+            pl.warnings.insert(0, msg_ctx_reduced(req, pl.ctx))
+        if not manual:
+            pl.full_offload = bool(chosen["full"])
+            ngl = int(fit.get("ngl", -1))
+            pl.gpu_layers = info.n_layer + 1 if ngl < 0 else min(ngl, info.n_layer + 1)
+            ts = fit.get("tensor_split")
+            if ts and len(ts) == len(pl.devices):
+                pl.tensor_split = [float(x) for x in ts]
+                for i, (d, n) in enumerate(zip(pl.devices, ts)):
+                    d.layers = int(n) - (1 if i == len(ts) - 1 and pl.gpu_layers > info.n_layer else 0)
+            elif len(pl.devices) == 1:
+                pl.devices[0].layers = min(pl.gpu_layers, info.n_layer)
+            ot = fit.get("override_tensor", "")
+            pl.cpu_expert_layers = override_layers(ot)
+            pl.n_cpu_moe = len(pl.cpu_expert_layers)
+            if not pl.full_offload:
+                if ot:
+                    pl.warnings.append(msg_partial_experts(len(pl.cpu_expert_layers), info.n_layer, reduce))
+                else:
+                    pl.warnings.append(msg_partial_layers(min(pl.gpu_layers, info.n_layer), info.n_layer, reduce))
+                if reduce:
+                    pl.notes.append(msg_no_fit_min())
+                if pl.ubatch > p.ubatch_size:
+                    pl.notes.append(msg_ubatch(pl.ubatch))
+            if p.kv_cache_type == "auto" and pl.kv_k != "f16":
+                pl.notes.append(msg_kv_q8(pl.full_offload))
+            pl.load_mode = p.load_mode if p.load_mode != "auto" else ("none" if pl.full_offload else "mmap")
         for d in pl.devices:
             pr = proj.get(d.name)
             if pr:
@@ -291,13 +447,13 @@ class ModelManager:
             pl.host = {"weights_mib": proj["Host"]["model"], "kv_mib": proj["Host"]["context"],
                        "compute_mib": proj["Host"]["compute"]}
         pl.totals["vram_used_mib"] = round(sum(d.used_mib for d in pl.devices), 1)
-        if not chosen["full"]:
-            ot = chosen["fit"].get("override_tensor")
-            pl.warnings.append(
-                "Engine projection: the model does not fully fit in VRAM at this context; "
-                + ("some expert weights will be kept in system RAM." if ot else
-                   f"{chosen['fit'].get('ngl')} layers will be offloaded to the GPU(s).")
-            )
+        if proj:
+            pl.fits = all(d.headroom_mib >= 0 for d in pl.devices)
+        elif not manual:
+            pl.fits = True  # the engine fit guarantees the margins
+        if manual and not pl.fits:
+            over = sum(max(0.0, -d.headroom_mib) for d in pl.devices)
+            pl.warnings.append(msg_manual_over(over))
 
     def _template_file(self, entry: ModelEntry, p: LoadParams) -> str | None:
         if p.chat_template_mode != "custom" or not p.chat_template_custom.strip():
@@ -349,16 +505,25 @@ class ModelManager:
             self.bus.activity_log(f"Loading {entry.id} ({'JIT request' if source == 'jit' else 'control panel'})",
                                   category="model", model=entry.id)
             self.bus.publish("load_stage", model=entry.id, stage="planning", label="Planning memory layout")
-            pl, extra = await self.plan(entry.id, overrides, verify=True, assume_evict=False)
+            pl, extra = await self.plan(entry.id, overrides, verify=True, assume_evict=False, projection=False)
             p = self.store.effective_load_params(entry.path, overrides)
             devices, _ = await self.devices(max_age=3.0)
             sel = [d.name for d in devices if not p.devices or d.name in p.devices]
             mmproj = pl.mmproj or None
             draft = self._draft_for(p)
-            if pl.source == "engine":
+            where = ("CPU only" if not devices else "full GPU offload" if pl.full_offload
+                     else "PARTIAL offload (part of the model in system RAM)")
+            self.bus.activity_log(
+                f"Plan{' (engine-verified)' if pl.source == 'engine' else ''}: {where}, KV {pl.kv_k.upper()}, "
+                f"context {pl.ctx:,}", category="model", level="info" if pl.full_offload or not devices else "warn")
+            if pl.ctx_reduced_from:
                 self.bus.activity_log(
-                    f"Engine projection: {'full GPU offload' if pl.full_offload else 'partial offload'}, "
-                    f"KV {pl.kv_k.upper()}, context {pl.ctx:,}", category="model")
+                    f"{entry.id}: context reduced from {pl.ctx_reduced_from:,} to {pl.ctx:,} tokens so the whole model "
+                    "stays in VRAM (change 'If it does not fit' in the load settings to keep the full context)",
+                    level="warn", category="model", model=entry.id)
+            for w in pl.warnings:
+                if w.startswith("Manual allocation"):
+                    self.bus.activity_log(f"{entry.id}: {w}", level="error", category="model", model=entry.id)
             port = free_port()
             api_key = new_id("", 16)
             spec = build_server_args(
@@ -382,6 +547,8 @@ class ModelManager:
                 raise ModelError(str(exc), 500, "load_failed") from exc
             if inst.pid:
                 self.monitor.watch_process(inst.pid, inst.model_id)
+            if inst.load_info.get("device_pci"):
+                self._device_pci.setdefault(eng.path, {}).update(inst.load_info["device_pci"])
             prof = self.store.profile(entry.path)
             prof.last_loaded = time.time()
             prof.load_count += 1
@@ -406,6 +573,7 @@ class ModelManager:
         self.bus.activity_log(f"Unloading {inst.model_id} ({reason})", category="model", model=inst.model_id)
         if inst.pid:
             self.monitor.unwatch_process(inst.pid)
+        self._spill.pop(inst.id, None)
         await inst.stop()
         self.instances.pop(inst.id, None)
         self.bus.publish("instance_removed", iid=inst.id, model=inst.model_id)
@@ -550,6 +718,61 @@ class ModelManager:
     def status(self) -> dict[str, Any]:
         return {"instances": [i.status() for i in self.instances.values()],
                 "pending": list(self._pending.keys())}
+
+    def note_request_error(self, rec: Any, error: str) -> None:
+        """Explain context overflows on models whose context was reduced to fit VRAM."""
+        if "exceed" not in error or "context" not in error:
+            return
+        inst = self.instances.get(getattr(rec, "instance", "") or "")
+        if inst is None or not inst.plan.ctx_reduced_from or inst.load_info.get("ctx_hint_shown"):
+            return
+        inst.load_info["ctx_hint_shown"] = True
+        self.bus.activity_log(
+            f"{inst.model_id}: a request needed more than the {inst.n_ctx:,}-token context this model was loaded with "
+            f"(reduced from {inst.plan.ctx_reduced_from:,} so the model fits in VRAM). For longer prompts use a Q4_0 KV "
+            "cache or a smaller quantization, or set 'If it does not fit' to 'Offload to CPU' (slower).",
+            level="warn", category="model", model=inst.model_id)
+
+    def check_residency(self, sample: dict[str, Any]) -> None:
+        """Detect Windows paging an engine's GPU memory into system RAM.
+
+        When VRAM is over-committed, WDDM keeps only part of a process's allocations
+        resident and pages the rest over PCIe on demand: the GPUs look busy "on and
+        off" and everything becomes extremely slow. The engine reports what it
+        allocated on each GPU; the OS reports how much of the process is resident in
+        dedicated VRAM. A persistent gap means memory was demoted.
+        """
+        procs = sample.get("procs") or {}
+        now = time.time()
+        for inst in self.ready_instances():
+            if not inst.pid or inst.t_ready is None or now - inst.t_ready < 8:  # let allocations settle
+                continue
+            rec = procs.get(str(inst.pid)) or {}
+            if "vram" not in rec:
+                continue
+            bufs = inst.load_info.get("buffers") or {}
+            allocated = sum(float(v) for dev, b in bufs.items() if not is_host_buffer(dev)
+                            for k, v in b.items() if k in ("model", "kv", "compute", "rs")) * MiB
+            if allocated <= 0:
+                continue
+            resident = sum(float(v or 0) for v in rec["vram"].values())
+            deficit = allocated - resident
+            st = self._spill.setdefault(inst.id, {"count": 0, "warned": False})
+            st["count"] = st["count"] + 1 if deficit > max(512 * MiB, 0.05 * allocated) else 0
+            spilled = st["count"] >= 3
+            mib = round(max(0.0, deficit) / MiB) if spilled else 0
+            if spilled != inst.load_info.get("vram_spill_active") or (spilled and abs(mib - inst.load_info.get("vram_spill_mib", 0)) > 256):
+                inst.load_info["vram_spill_active"] = spilled
+                inst.load_info["vram_spill_mib"] = mib
+                inst.load_info["vram_shared_mib"] = round(sum(float(v or 0) for v in (rec.get("shared") or {}).values()) / MiB)
+                self.bus.publish("instance", instance=inst.status())
+            if spilled and not st["warned"]:
+                st["warned"] = True
+                self.bus.activity_log(
+                    f"{inst.model_id}: Windows moved about {mib / 1024:.1f} GiB of the model's GPU memory into system RAM "
+                    "(VRAM over-committed). Prompt processing and generation will be extremely slow. Use automatic "
+                    "allocation with 'Reduce context', lower the context, or close other applications using the GPU.",
+                    level="error", category="model", model=inst.model_id)
 
 
 def _run_capture(args: list[str], timeout: float) -> tuple[int, str]:

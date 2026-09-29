@@ -321,7 +321,7 @@ class OpenAIRouter:
                     "max_context_length": e.info.context_length,
                 }
                 if inst:
-                    o["loaded_context_length"] = inst.plan.ctx
+                    o["loaded_context_length"] = inst.n_ctx
                 caps = []
                 if e.template.get("tools"):
                     caps.append("tool_use")
