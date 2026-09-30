@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,7 @@ def build_router(ctx: AppContext) -> APIRouter:
             "totals": ctx.tracker.totals,
             "active_requests": len(ctx.tracker.active),
             "system": ctx.extras.get("sysinfo"),
+            "platform": sys.platform,
             "window": ctx.extras.get("window_mode", False),
             "can_exit": bool(ctx.extras.get("can_exit") or ctx.extras.get("window_mode")),
             "notice": ctx.extras.get("notice"),

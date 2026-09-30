@@ -1,8 +1,8 @@
 """Hardware detection and live telemetry.
 
-Windows: DXGI (adapters), PDH (VRAM / utilisation, as in Task Manager), ADL
-(AMD temperatures, clocks, power, fan). Linux: amdgpu sysfs / nvidia-smi.
-CPU and memory via psutil everywhere.
+Linux: amdgpu sysfs (VRAM, utilisation, temperatures, power, clocks, fan), DRM
+fdinfo (VRAM per process) and nvidia-smi. Windows: DXGI (adapters), PDH (VRAM /
+utilisation, as in Task Manager), ADL (AMD sensors). CPU and memory via psutil.
 """
 
 from __future__ import annotations
@@ -41,6 +41,10 @@ class GpuInfo:
     adl_index: int | None = None
     sysfs: dict[str, Any] = field(default_factory=dict)
     nvidia_index: int | None = None
+    pci: str = ""
+    boot_vga: bool = False  # drives the boot display (and usually the desktop)
+    rebar: bool | None = None  # Resizable BAR (CPU can map all of VRAM)
+    pcie: str = ""  # current PCIe link, e.g. "PCIe 4.0 x16"
 
 
 _VENDORS = {0x1002: "AMD", 0x10DE: "NVIDIA", 0x8086: "Intel", 0x1414: "Microsoft"}
@@ -129,7 +133,9 @@ class HardwareMonitor:
         out: list[GpuInfo] = []
         for c in _plat.amdgpu_cards():
             out.append(
-                GpuInfo(id="", name=c["name"], vendor="AMD", vram_total=c["vram_total"], bus=c.get("bus"), sysfs=c)
+                GpuInfo(id="", name=c["name"], vendor="AMD", vram_total=c["vram_total"], bus=c.get("bus"), sysfs=c,
+                        driver=c.get("driver", ""), pci=c.get("pci", ""), boot_vga=bool(c.get("boot_vga")),
+                        rebar=c.get("rebar"), pcie=c.get("pcie", ""))
             )
         for n in _plat.nvidia_sample():
             out.append(
@@ -142,7 +148,15 @@ class HardwareMonitor:
 
     def system_info(self) -> dict[str, Any]:
         vm = psutil.virtual_memory()
-        return {
+        extra: dict[str, Any] = {}
+        if not IS_WINDOWS:
+            try:
+                extra["vulkan_driver"] = _plat.mesa_version()
+                extra["render_access"] = _plat.render_access()
+                extra["distro"] = _os_release()
+            except Exception:
+                log.debug("linux system info failed", exc_info=True)
+        return {**extra,
             "os": f"{platform.system()} {platform.release()} ({platform.version()})",
             "machine": platform.machine(),
             "hostname": platform.node(),
@@ -179,10 +193,24 @@ class HardwareMonitor:
     def map_engine_devices(self, devices: list[dict[str, Any]]) -> dict[str, str]:
         """Map engine device names (Vulkan0, ROCm1 ...) to gpu ids.
 
-        Devices are matched by name, and in order among identically named
-        devices (engines enumerate in PCI order, matching our bus sort).
+        Linux (amdgpu): by memory in use, then Mesa's device order (see platform.linux.match_engine_devices).
+        Otherwise devices are matched by name, and in order among identically named devices (engines
+        enumerate in PCI order, matching our bus sort).
         """
         mapping: dict[str, str] = {}
+        cards = [g for g in self.gpus if g.sysfs]
+        if not IS_WINDOWS and cards and len(cards) == len(self.gpus):
+            used = {}
+            for g in cards:
+                v = _plat.amdgpu_sample(g.sysfs).get("vram_used")
+                if v is not None:
+                    used[g.pci] = v
+            by_pci = {g.pci: g for g in cards}
+            for name, card in _plat.match_engine_devices(devices, [g.sysfs for g in cards], used).items():
+                g = by_pci.get(card.get("pci"))
+                if g is not None:
+                    mapping[name] = g.id
+            return mapping
         pool = list(self.gpus)
         for d in devices:
             desc = _norm_name(d.get("description", ""))
@@ -314,10 +342,18 @@ class HardwareMonitor:
                 out.append(rec)
             return out
         nv = None
+        per_proc = {}
+        if watch and any(g.sysfs for g in self.gpus):
+            try:
+                per_proc = _plat.proc_vram(watch)
+            except Exception:
+                log.debug("fdinfo read failed", exc_info=True)
         for g in self.gpus:
             rec = {"id": g.id, "name": g.name, "vram_total": g.vram_total}
             if g.sysfs:
                 rec.update(_plat.amdgpu_sample(g.sysfs))
+                if g.pci in per_proc:
+                    rec["_proc_vram"] = dict(per_proc[g.pci])
             elif g.nvidia_index is not None:
                 if nv is None:
                     nv = {n["index"]: n for n in _plat.nvidia_sample()}
@@ -365,6 +401,15 @@ class HardwareMonitor:
                 next_t = time.monotonic()
                 delay = self.interval
             self._stop.wait(delay)
+
+
+def _os_release() -> str:
+    try:
+        with open("/etc/os-release", encoding="utf-8") as f:
+            kv = dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+        return kv.get("PRETTY_NAME", "").strip('"')
+    except OSError:
+        return ""
 
 
 def recommended_threads() -> tuple[int, int]:

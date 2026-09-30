@@ -110,7 +110,8 @@ class ModelManager:
         return await asyncio.to_thread(self.engines.list_devices, Path(eng.path), max_age)
 
     def device_map(self, devices: list[EngineDevice]) -> dict[str, str]:
-        return self.monitor.map_engine_devices([{"name": d.name, "description": d.description} for d in devices])
+        return self.monitor.map_engine_devices([{"name": d.name, "description": d.description,
+                                                 "total_mib": d.total_mib, "free_mib": d.free_mib} for d in devices])
 
     # ----- lifecycle helpers ------------------------------------------------------------
 
