@@ -1,16 +1,26 @@
-"""Linux GPU telemetry: amdgpu sysfs and nvidia-smi."""
+"""Linux GPU telemetry: amdgpu sysfs, DRM fdinfo (per-process VRAM) and nvidia-smi."""
 
 from __future__ import annotations
 
 import glob
+import grp
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("winrunner.linux")
+
+# Roots are module level so tests can point them at a fake tree.
+SYS_DRM = "/sys/class/drm"
+PROC = "/proc"
+DEV_DRI = "/dev/dri"
+PCI_IDS = ("/usr/share/misc/pci.ids", "/usr/share/hwdata/pci.ids", "/usr/share/pci.ids")
+
+_PCIE_GEN = {"2.5": "1.0", "5.0": "2.0", "8.0": "3.0", "16.0": "4.0", "32.0": "5.0", "64.0": "6.0"}
 
 
 def _read(path: str | Path) -> str | None:
@@ -29,10 +39,59 @@ def _read_int(path: str | Path) -> int | None:
         return None
 
 
+def _pci_name(vendor: int, device: int, sub_vendor: int | None, sub_device: int | None) -> str:
+    """Marketing name from the pci.ids database (subsystem entry first), '' when unknown."""
+    path = next((p for p in PCI_IDS if os.path.isfile(p)), None)
+    if not path:
+        return ""
+    ven, dev = f"{vendor:04x}", f"{device:04x}"
+    sub = f"{sub_vendor:04x} {sub_device:04x}" if sub_vendor is not None and sub_device is not None else None
+    in_vendor = in_device = False
+    dev_name = ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                if not line.startswith("\t"):
+                    if in_vendor:
+                        break
+                    in_vendor = line[:4].lower() == ven
+                    continue
+                if not in_vendor:
+                    continue
+                if line.startswith("\t\t"):
+                    if in_device and sub and line[2:11].lower() == sub:
+                        return line[11:].strip()
+                    continue
+                if in_device:
+                    break
+                if line[1:5].lower() == dev:
+                    in_device = True
+                    dev_name = line[5:].strip()
+    except OSError:
+        return ""
+    return dev_name
+
+
+def _pcie_link(dev: Path) -> str:
+    speed = _read(dev / "current_link_speed") or ""
+    width = _read(dev / "current_link_width") or ""
+    max_w = _read(dev / "max_link_width") or ""
+    m = re.match(r"([\d.]+)\s*GT/s", speed)
+    if not m or not width:
+        return ""
+    gen = _PCIE_GEN.get(m.group(1), m.group(1) + " GT/s")
+    txt = f"PCIe {gen} x{width}"
+    if max_w and max_w != width:
+        txt += f" (card supports x{max_w})"
+    return txt
+
+
 def amdgpu_cards() -> list[dict[str, Any]]:
     """Static info for amdgpu devices from /sys/class/drm."""
     out = []
-    for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+    for card in sorted(glob.glob(os.path.join(SYS_DRM, "card[0-9]*"))):
         if "-" in os.path.basename(card):
             continue  # connectors (card0-DP-1)
         dev = Path(card) / "device"
@@ -42,19 +101,28 @@ def amdgpu_cards() -> list[dict[str, Any]]:
         total = _read_int(dev / "mem_info_vram_total")
         if not total:
             continue
-        name = _read(dev / "product_name") or ""
         pci = os.path.basename(os.path.realpath(dev))
-        hwmons = glob.glob(str(dev / "hwmon" / "hwmon*"))
+        dev_id = int(_read(dev / "device") or "0", 16)
+        sub_v, sub_d = _read(dev / "subsystem_vendor"), _read(dev / "subsystem_device")
+        name = _read(dev / "product_name") or _pci_name(
+            0x1002, dev_id, int(sub_v, 16) if sub_v else None, int(sub_d, 16) if sub_d else None)
+        hwmons = sorted(glob.glob(str(dev / "hwmon" / "hwmon*")))
+        vis = _read_int(dev / "mem_info_vis_vram_total")
         out.append(
             {
                 "sysfs": str(dev),
                 "hwmon": hwmons[0] if hwmons else "",
-                "name": name or f"AMD GPU {_read(dev / 'device') or ''}".strip(),
+                "name": name or f"AMD GPU 0x{dev_id:04x}",
                 "vendor_id": 0x1002,
-                "device_id": int(_read(dev / "device") or "0", 16),
+                "device_id": dev_id,
                 "vram_total": total,
                 "pci": pci,
                 "bus": int(pci.split(":")[1], 16) if pci.count(":") >= 2 else None,
+                "boot_vga": _read(dev / "boot_vga") == "1",
+                # Resizable BAR: the CPU can map all of VRAM (otherwise only a 256 MiB window)
+                "rebar": (vis >= total - (64 << 20)) if vis else None,
+                "pcie": _pcie_link(dev),
+                "driver": _read("/sys/module/amdgpu/version") or f"amdgpu (Linux {os.uname().release})",
             }
         )
     return out
@@ -103,6 +171,101 @@ def amdgpu_sample(card: dict[str, Any]) -> dict[str, float]:
     return out
 
 
+_UNITS = {"": 1, "B": 1, "KiB": 1024, "kB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
+
+
+def _fdinfo_bytes(v: str) -> int | None:
+    m = re.match(r"\s*(\d+)\s*(\w*)", v)
+    if not m:
+        return None
+    return int(m.group(1)) * _UNITS.get(m.group(2), 1)
+
+
+def proc_vram(pids: set[int]) -> dict[str, dict[int, int]]:
+    """VRAM used by each process on each GPU (PCI address -> pid -> bytes), from DRM fdinfo.
+
+    amdgpu reports per DRM client: ``drm-pdev``, ``drm-client-id`` and ``drm-memory-vram`` (older kernels) or
+    ``drm-resident-vram`` / ``drm-total-vram``. File descriptors of the same client are counted once.
+    """
+    out: dict[str, dict[int, int]] = {}
+    for pid in pids:
+        seen: set[tuple[str, str]] = set()
+        base = os.path.join(PROC, str(pid), "fdinfo")
+        try:
+            fds = os.listdir(base)
+        except OSError:
+            continue
+        for fd in fds:
+            txt = _read(os.path.join(base, fd))
+            if not txt or "drm-pdev" not in txt:
+                continue
+            kv: dict[str, str] = {}
+            for line in txt.splitlines():
+                k, _, v = line.partition(":")
+                kv[k.strip()] = v.strip()
+            pdev, client = kv.get("drm-pdev", ""), kv.get("drm-client-id", fd)
+            if not pdev or (pdev, client) in seen:
+                continue
+            seen.add((pdev, client))
+            raw = kv.get("drm-resident-vram") or kv.get("drm-memory-vram") or kv.get("drm-total-vram")
+            b = _fdinfo_bytes(raw) if raw else None
+            if b:
+                out.setdefault(pdev, {})
+                out[pdev][pid] = out[pdev].get(pid, 0) + b
+    return out
+
+
+def match_engine_devices(devices: list[dict[str, Any]], cards: list[dict[str, Any]],
+                         used_now: dict[str, float]) -> dict[str, dict[str, Any]]:
+    """Map engine devices (Vulkan0, ...) to amdgpu cards.
+
+    Identical GPUs cannot be told apart by name. The memory in use can: the engine reports each device's
+    free memory, sysfs each card's used VRAM, and the GPU driving the desktop uses hundreds of MiB more.
+    Without a clear difference the order is Mesa's device order: the boot display GPU first, then PCI order.
+    """
+    pool = sorted(cards, key=lambda c: (not c.get("boot_vga"), c.get("bus") if c.get("bus") is not None else 999))
+    mapping: dict[str, dict[str, Any]] = {}
+    for d in devices:
+        total = float(d.get("total_mib") or 0) * 1024 * 1024
+        cand = [c for c in pool if not total or abs(c["vram_total"] - total) < 512 * 1024 * 1024] or list(pool)
+        if not cand:
+            break
+        best = cand[0]
+        if len(cand) > 1 and d.get("free_mib") is not None and d.get("total_mib"):
+            eng_used = (float(d["total_mib"]) - float(d["free_mib"])) * 1024 * 1024
+            scored = sorted(cand, key=lambda c: abs(used_now.get(c["pci"], 0.0) - eng_used))
+            gap = abs(abs(used_now.get(scored[1]["pci"], 0.0) - eng_used) - abs(used_now.get(scored[0]["pci"], 0.0) - eng_used))
+            if gap > 96 * 1024 * 1024:
+                best = scored[0]
+        mapping[d["name"]] = best
+        pool.remove(best)
+    return mapping
+
+
+def mesa_version() -> str:
+    """Version of the Mesa Vulkan driver package (RADV), '' when unknown."""
+    exe = shutil.which("dpkg-query")
+    if not exe:
+        return ""
+    try:
+        r = subprocess.run([exe, "-W", "-f=${Version}", "mesa-vulkan-drivers"], capture_output=True, text=True,
+                           timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def render_access() -> dict[str, Any]:
+    """Whether this user may use the GPUs for compute (/dev/dri/renderD*)."""
+    nodes = sorted(glob.glob(os.path.join(DEV_DRI, "renderD*")))
+    ok = [n for n in nodes if os.access(n, os.R_OK | os.W_OK)]
+    try:
+        groups = sorted({grp.getgrgid(g).gr_name for g in os.getgroups()})
+    except (KeyError, OSError):
+        groups = []
+    return {"nodes": nodes, "accessible": ok, "groups": groups}
+
+
 def nvidia_sample() -> list[dict[str, Any]]:
     exe = shutil.which("nvidia-smi")
     if not exe:
@@ -146,7 +309,7 @@ def nvidia_sample() -> list[dict[str, Any]]:
 
 
 def cpu_brand() -> str:
-    txt = _read("/proc/cpuinfo") or ""
+    txt = _read(os.path.join(PROC, "cpuinfo")) or ""
     for line in txt.splitlines():
         if line.lower().startswith("model name"):
             return line.split(":", 1)[1].strip()

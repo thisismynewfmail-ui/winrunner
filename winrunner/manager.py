@@ -15,14 +15,16 @@ from typing import Any, Callable
 
 from .cmdline import build_fit_args, build_server_args
 from .config import LoadParams, SettingsStore
-from .engine import EngineDevice, EngineInfo, EngineManager
+from .engine import EngineDevice, EngineInfo, EngineManager, engine_env
 from .events import EventBus, RequestTracker
 from .faults import GPU_DEVICE_LOST, gpu_fault, tdr_hint, tdr_limited
 from .hardware import HardwareMonitor
 from .instance import EngineInstance
+from .probe import as_measurement, server_probe
 from .library import ModelEntry, ModelLibrary
 from .paths import IS_WINDOWS, DataPaths
-from .planner import Plan, Planner, parse_fit_args, parse_fit_print
+from .planner import (Plan, Planner, apply_measurement, device_targets, fit_to_engine, measured_used, parse_fit_args,
+                      parse_fit_print)
 from .util import free_port, new_id
 
 log = logging.getLogger("winrunner.manager")
@@ -36,6 +38,8 @@ RECOVERY_DELAYS_S = (3.0, 10.0, 30.0)  # pause before each reload attempt (drive
 DEVICE_WAIT_S = 90.0  # longest wait for the GPUs to become usable again after a reset
 DEVICE_POLL_S = 2.0
 DEVICE_SETTLE_MIB = 256  # free VRAM counts as settled when it grows less than this between two polls
+RELEASE_WAIT_S = 8.0  # longest wait for an unloaded model's VRAM to be released before planning the next load
+MEASURE_TTL_S = 900.0  # engine projections (llama-fit-params) do not depend on free memory: cache them
 
 SOURCE_LABELS = {"jit": "JIT request", "ui": "control panel", "startup": "startup", "recovery": "automatic restart"}
 _RECOVERY_ABORTS = ("shutting_down", "model_replaced")  # reasons to stop a recovery at once (no retries)
@@ -79,7 +83,7 @@ class ModelManager:
         self._background: set[asyncio.Task] = set()
         self._substitutes: set[tuple[str, str]] = set()  # (requested name, model answering) already reported
         self._tdr_hint_shown = False
-        self._plan_cache: dict[str, tuple[float, dict]] = {}
+        self._measure_cache: dict[str, tuple[float, dict]] = {}
         self._shutting_down = False
         self.exiting: Any = lambda: False  # set by the entry point: True once the server is stopping
         self.ui_clients = 0
@@ -106,7 +110,8 @@ class ModelManager:
         return await asyncio.to_thread(self.engines.list_devices, Path(eng.path), max_age)
 
     def device_map(self, devices: list[EngineDevice]) -> dict[str, str]:
-        return self.monitor.map_engine_devices([{"name": d.name, "description": d.description} for d in devices])
+        return self.monitor.map_engine_devices([{"name": d.name, "description": d.description,
+                                                 "total_mib": d.total_mib, "free_mib": d.free_mib} for d in devices])
 
     # ----- lifecycle helpers ------------------------------------------------------------
 
@@ -170,13 +175,18 @@ class ModelManager:
         return [i for i in self.instances.values() if i.model_id != model_id and i.state in ("ready", "loading")]
 
     async def plan(self, model_id: str, overrides: dict | None = None, verify: bool = False,
-                   assume_evict: bool = True) -> tuple[Plan, dict[str, Any]]:
+                   assume_evict: bool = True, fresh_devices: bool = False) -> tuple[Plan, dict[str, Any]]:
+        """Memory plan for loading ``model_id``.
+
+        ``verify``: measure the placement with the engine's own allocator (llama-fit-params) and correct it
+        until every GPU is filled to its free memory minus the margin. Loads always verify.
+        """
         entry = self.library.get(model_id) or self.library.resolve(model_id)
         if entry is None:
             raise ModelError(f"model '{model_id}' not found in library", 404, "model_not_found")
         eng = await self.engine_async()
         p = self.store.effective_load_params(entry.path, overrides)
-        devices, dev_err = await self.devices(max_age=3.0)
+        devices, dev_err = await self.devices(max_age=0 if fresh_devices else 3.0)
         evicting = self._evict_set(entry.id) if assume_evict else []
         mmproj = self._mmproj_for(entry, p)
         mm_size = 0
@@ -188,147 +198,155 @@ class ModelManager:
                 mm_size = 0
             mm_hint = self.store.profile(entry.path).mmproj_est_mib or None
         draft = self._draft_for(p)
+        es = self.store.settings.engine
+        hw = self.store.settings.hardware
+        engine_places = bool(eng and es.placement == "engine" and eng.has("--fit", "-fit"))
         planner = Planner(
             entry.info, p, devices, self.device_map(devices),
-            margin_mib=self.store.settings.hardware.vram_margin_mib,
-            margin_per_device=self.store.settings.hardware.vram_margin_per_device,
+            margin_mib=hw.vram_margin_mib,
+            margin_per_device=hw.vram_margin_per_device,
             reclaim_mib=self._reclaim(evicting),
             mmproj_size=mm_size, mmproj_mib_hint=mm_hint,
             draft_info=draft.info if draft else None,
-            engine_fit=bool(eng and self.store.settings.engine.use_engine_fit and eng.has("--fit", "-fit")),
+            engine_fit=engine_places,
             model_id=entry.id,
+            overrides_supported=bool(eng is None or eng.has("--override-tensor", "-ot")),
         )
-        pl = planner.plan()
+        sel = [d.name for d in devices if not p.devices or d.name in p.devices]
+        margins = self._margins(devices, p)
+        can_measure = bool(eng and eng.fit_params and devices and es.use_engine_fit)
+        pl: Plan | None = None
+        if verify and can_measure and p.gpu_offload == "auto" and not engine_places:
+            measure = self._measurer(eng, entry, p, sel, planner, mmproj, draft, margins)
+            try:
+                mm_before = planner.mmproj_mib
+                pl = await asyncio.to_thread(fit_to_engine, planner, measure)
+                if abs(planner.mmproj_mib - mm_before) > 32:
+                    # the first probe measured the vision projector: fit again with its real size
+                    pl = await asyncio.to_thread(fit_to_engine, planner, measure)
+            except Exception as exc:  # the projection is advisory: fall back to the estimate
+                log.warning("engine memory projection failed for %s: %s", entry.id, exc)
+                pl = planner.plan()
+                pl.warnings.append(f"Engine memory projection failed ({exc}); using the estimate.")
+        if pl is None:
+            pl = planner.plan()
+            if verify and can_measure:
+                try:
+                    if engine_places:
+                        await self._engine_fit_preview(eng, entry, p, pl, sel, margins)
+                    else:  # manual mode: show what the engine projects for the user's settings
+                        m = await asyncio.to_thread(self._measurer(eng, entry, p, sel, None, mmproj, draft, margins), pl)
+                        apply_measurement(pl, m)
+                        over = [d.name for d in pl.devices
+                                if measured_used(m.get(d.name, {})) > device_targets(pl)[d.name] + 0.5]
+                        if over:
+                            pl.warnings.append(f"Engine projection: exceeds free VRAM minus the margin on {', '.join(over)}.")
+                except Exception as exc:
+                    pl.warnings.append(f"Engine memory projection failed: {exc}")
         pl.mmproj = mmproj or ""
         pl.draft = draft.path if draft else ""
-        if pl.use_engine_fit and evicting:
-            # the engine measures free memory itself; the evicted model is still resident during planning
-            pl.notes.append("Memory projection accounts for the currently loaded model being unloaded first.")
+        if evicting:
+            pl.notes.append(f"Planned for the free VRAM after {', '.join(i.model_id for i in evicting)} is unloaded.")
+        if verify and not can_measure and eng and not eng.fit_params:
+            pl.notes.append("This engine build does not include llama-fit-params; the plan is an estimate.")
+        if mmproj and p.mmproj_offload and not mm_hint:
+            pl.notes.append("Vision projector memory is estimated from its file size; the exact figure is learned "
+                            "at the first load and used from then on.")
         extra = {
             "entry": entry.to_summary(),
             "devices": [d.__dict__ for d in devices],
             "device_error": dev_err,
             "engine": eng.to_dict() if eng else None,
             "evicting": [i.model_id for i in evicting],
-            "margins": self._margins(devices, p),
+            "margins": margins,
         }
-        if verify and eng and eng.fit_params and devices and not evicting:
-            try:
-                await self._verify_with_engine(eng, entry, p, pl, devices)
-            except Exception as exc:  # projection is advisory; never block a load on it
-                pl.warnings.append(f"Engine memory projection failed: {exc}")
-        elif verify and evicting:
-            pl.notes.append("Engine projection skipped: the engine measures free VRAM directly, and "
-                            f"{', '.join(i.model_id for i in evicting)} is still loaded. It runs automatically at load time, "
-                            "after the current model is unloaded.")
-        elif verify and eng and not eng.fit_params:
-            pl.notes.append("This engine build does not include llama-fit-params; the analytic estimate is used.")
         if eng:
-            sel = [d.name for d in devices if not p.devices or d.name in p.devices]
             spec = build_server_args(
                 eng, entry.path, p, pl, sel, 0, entry.id, "", mmproj, draft.path if draft else None,
                 self._template_file(entry, p), entry.info.kind == "embedding",
-                self.store.settings.engine.log_verbosity, self._margins(devices, p),
+                self.store.settings.engine.log_verbosity, margins,
             )
             args = [a for a in spec.args]
             i = args.index("--port")
             args[i + 1] = "<port>"
-            extra["command"] = " ".join(args)
+            extra["command"] = " ".join(_quote(a) for a in args)
         return pl, extra
 
-    async def _verify_with_engine(self, eng: EngineInfo, entry: ModelEntry, p: LoadParams, pl: Plan,
-                                  devices: list[EngineDevice]) -> None:
-        sel = [d.name for d in devices if not p.devices or d.name in p.devices]
-        margins = self._margins(devices, p)
-        if pl.mmproj and margins and p.mmproj_offload:
-            margins = [margins[0] + int(pl.totals.get("mmproj_mib", 0))] + margins[1:]
-        key_src = json.dumps([entry.path, entry.info.mtime, p.model_dump(mode="json"), pl.ctx, pl.kv_k,
-                              [(d.name, d.free_mib // 256) for d in devices], eng.path], sort_keys=True)
-        key = hashlib.sha1(key_src.encode()).hexdigest()
-        cached = self._plan_cache.get(key)
-        if cached and time.time() - cached[0] < 120:
-            self._apply_projection(pl, cached[1], devices)
-            return
-        candidates = [pl.kv_k]
-        if p.kv_cache_type == "auto":
-            candidates = ["f16", "q8_0"] if p.flash_attn != "off" else ["f16"]
-        chosen: dict[str, Any] | None = None
-        for kv in candidates:
-            q = Plan(**{**pl.__dict__})
-            q.kv_k = q.kv_v = kv if p.kv_cache_type == "auto" else pl.kv_k
-            if p.kv_cache_type != "auto":
-                q.kv_v = pl.kv_v
-            if kv != "f16" and q.flash_attn == "auto":
-                q.flash_attn = "on"
-            q.use_engine_fit = True
-            args = build_fit_args(eng, entry.path, p, q, sel, margins, print_mode=False)
-            if not args:
-                return
-            rc, out = await asyncio.to_thread(_run_capture, args, 120)
-            fit = parse_fit_args(out)
-            if rc != 0 or not fit:
-                raise RuntimeError(f"llama-fit-params failed ({rc}): {out.strip().splitlines()[-1] if out.strip() else ''}")
-            ngl = fit.get("ngl", -1)
-            full = (ngl < 0 or ngl >= entry.info.n_layer) and "override_tensor" not in fit
-            chosen = {"kv_k": q.kv_k, "kv_v": q.kv_v, "flash_attn": q.flash_attn, "fit": fit, "full": full}
-            if full:
-                break
-        if chosen is None:
-            return
-        q = Plan(**{**pl.__dict__})
-        q.kv_k, q.kv_v, q.flash_attn = chosen["kv_k"], chosen["kv_v"], chosen["flash_attn"]
-        fit = chosen["fit"]
-        ngl = fit.get("ngl", -1)
-        q.gpu_layers = entry.info.n_layer + 1 if ngl < 0 else ngl
-        q.tensor_split = fit.get("tensor_split") or pl.tensor_split
-        q.n_cpu_moe = 0
-        q.use_engine_fit = False
-        pargs = build_fit_args(eng, entry.path, p, q, sel, margins, print_mode=True)
-        if fit.get("override_tensor") and pargs:
-            pargs += ["-ot", fit["override_tensor"]]
-        proj: dict[str, Any] = {}
-        if pargs:
-            rc, out = await asyncio.to_thread(_run_capture, pargs, 120)
-            if rc == 0:
-                proj = parse_fit_print(out)
-        chosen["projection"] = proj
-        self._plan_cache[key] = (time.time(), chosen)
-        self._apply_projection(pl, chosen, devices)
+    def _measurer(self, eng: EngineInfo, entry: ModelEntry, p: LoadParams, sel: list[str],
+                  planner: Planner | None = None, mmproj: str | None = None, draft: ModelEntry | None = None,
+                  margins: list[int] | None = None):
+        """Measure a plan's memory with the engine itself (cached: projections do not depend on free memory).
 
-    @staticmethod
-    def _apply_projection(pl: Plan, chosen: dict[str, Any], devices: list[EngineDevice]) -> None:
-        was_kv = pl.kv_k
-        pl.kv_k, pl.kv_v = chosen["kv_k"], chosen["kv_v"]
-        pl.flash_attn = chosen["flash_attn"]
-        pl.full_offload = bool(chosen["full"])
-        pl.source = "engine"
-        proj = chosen.get("projection") or {}
-        pl.engine = {"fit": chosen["fit"], "projection": proj, "full_offload": chosen["full"]}
-        if was_kv != pl.kv_k:
-            pl.notes = [n for n in pl.notes if "KV cache set to" not in n]
-            if pl.kv_k != "f16":
-                pl.notes.append("Engine projection: KV cache Q8_0 needed for a full GPU offload.")
+        Preferred: a llama-server probe with the exact launch arguments (see probe.py). Fallback:
+        llama-fit-params --fit-print, which overstates the output device's compute buffer.
+        """
+        use_server = eng.has("--fit", "-fit") and eng.has("--log-verbosity", "-lv")
+
+        def measure(pl: Plan) -> dict[str, dict[str, float]]:
+            if use_server:
+                port = free_port()
+                spec = build_server_args(
+                    eng, entry.path, p, _explicit_copy(pl), sel, port, entry.id, new_id("", 16), mmproj,
+                    draft.path if draft else None, self._template_file(entry, p), entry.info.kind == "embedding",
+                    max(4, self.store.settings.engine.log_verbosity), margins or [])
+                args = _with_fit_on(spec.args, eng, margins or [])
+                key_args = [a for a in args if a not in (str(port),)]
+                key_args = [a for i, a in enumerate(key_args) if i == 0 or key_args[i - 1] != "--api-key"]
             else:
-                pl.notes.append("Engine projection: full F16 KV cache fits in VRAM.")
-        for d in pl.devices:
-            pr = proj.get(d.name)
-            if pr:
-                d.weights_mib = pr["model"]
-                d.kv_mib = pr["context"]
-                d.compute_mib = pr["compute"]
-                d.output_mib = 0.0
-                d.draft_mib = 0.0
-        if "Host" in proj:
-            pl.host = {"weights_mib": proj["Host"]["model"], "kv_mib": proj["Host"]["context"],
-                       "compute_mib": proj["Host"]["compute"]}
-        pl.totals["vram_used_mib"] = round(sum(d.used_mib for d in pl.devices), 1)
-        if not chosen["full"]:
-            ot = chosen["fit"].get("override_tensor")
-            pl.warnings.append(
-                "Engine projection: the model does not fully fit in VRAM at this context; "
-                + ("some expert weights will be kept in system RAM." if ot else
-                   f"{chosen['fit'].get('ngl')} layers will be offloaded to the GPU(s).")
-            )
+                args = build_fit_args(eng, entry.path, p, pl, sel, [], print_mode=True)
+                if not args:
+                    raise RuntimeError("the engine build has no llama-fit-params")
+                key_args = args
+            key = hashlib.sha1(json.dumps([key_args, entry.info.mtime, entry.info.file_size, eng.path,
+                                           eng.build]).encode()).hexdigest()
+            now = time.time()
+            hit = self._measure_cache.get(key)
+            if hit and now - hit[0] < MEASURE_TTL_S:
+                res = hit[1]
+            elif use_server:
+                pr = server_probe(args, single_device=sel[0] if len(sel) == 1 else None)
+                res = {"devices": as_measurement(pr, pl), "mmproj": pr.mmproj_mib}
+            else:
+                rc, out = _run_capture(args, 240)
+                proj = parse_fit_print(out) if rc == 0 else {}
+                if not proj:
+                    tail = out.strip().splitlines()[-1] if out.strip() else ""
+                    raise RuntimeError(f"llama-fit-params failed ({rc}): {tail[:300]}")
+                res = {"devices": proj, "mmproj": None}
+            if len(self._measure_cache) > 64:
+                self._measure_cache.clear()
+            self._measure_cache[key] = (now, res)
+            learned = res.get("mmproj")
+            if learned and planner is not None and p.mmproj_offload:
+                planner.mmproj_mib = float(learned)
+                prof = self.store.profile(entry.path)
+                if abs(prof.mmproj_est_mib - float(learned)) > 1:
+                    prof.mmproj_est_mib = float(learned)
+                    self.store.set_profile(entry.path, prof)
+            return res["devices"]
+
+        return measure
+
+    async def _engine_fit_preview(self, eng: EngineInfo, entry: ModelEntry, p: LoadParams, pl: Plan,
+                                  sel: list[str], margins: list[int]) -> None:
+        """Placement "engine": show what llama.cpp's --fit will choose (it decides again at load)."""
+        args = build_fit_args(eng, entry.path, p, pl, sel, margins, print_mode=False)
+        if not args:
+            return
+        rc, out = await asyncio.to_thread(_run_capture, args, 240)
+        fit = parse_fit_args(out)
+        if rc != 0 or not fit:
+            raise RuntimeError(f"llama-fit-params failed ({rc}): {out.strip().splitlines()[-1] if out.strip() else ''}")
+        ngl = fit.get("ngl", -1)
+        pl.gpu_layers = entry.info.n_layer + 1 if ngl < 0 else ngl
+        pl.tensor_split = fit.get("tensor_split") or pl.tensor_split
+        pl.overrides = [x for x in (fit.get("override_tensor") or "").split(",") if x]
+        pl.engine = {"fit": fit}
+        pl.source = "engine"
+        pl.full_offload = pl.gpu_layers > entry.info.n_layer and not pl.overrides
+        m = await asyncio.to_thread(self._measurer(eng, entry, p, sel, None, pl.mmproj or None, None, margins),
+                                    _explicit_copy(pl))
+        apply_measurement(pl, m)
 
     def _template_file(self, entry: ModelEntry, p: LoadParams) -> str | None:
         if p.chat_template_mode != "custom" or not p.chat_template_custom.strip():
@@ -375,24 +393,30 @@ class ModelManager:
             existing = self.instance_for_model(entry.id)
             if existing and existing.state == "ready" and not overrides:
                 return existing
+            released: list[str] = []
             if existing:
+                released += [d.name for d in existing.plan.devices]
                 await self._unload(existing, reason="reload")
             for inst in self._evict_set(entry.id):
                 await self._drain(inst)
+                released += [d.name for d in inst.plan.devices]
                 await self._unload(inst, reason=f"evicted for {entry.id}")
             self.bus.activity_log(f"Loading {entry.id} ({SOURCE_LABELS.get(source, source)})",
                                   category="model", model=entry.id)
+            if released:
+                # the unloaded engine's VRAM is freed asynchronously by the driver: plan with the real free memory
+                self.bus.publish("load_stage", model=entry.id, stage="planning", label="Waiting for VRAM release")
+                await self._wait_for_release(sorted(set(released)))
             self.bus.publish("load_stage", model=entry.id, stage="planning", label="Planning memory layout")
-            pl, extra = await self.plan(entry.id, overrides, verify=True, assume_evict=False)
+            pl, extra = await self.plan(entry.id, overrides, verify=True, assume_evict=False, fresh_devices=True)
             p = self.store.effective_load_params(entry.path, overrides)
-            devices, _ = await self.devices(max_age=3.0)
+            devices, _ = await self.devices(max_age=60.0)
             sel = [d.name for d in devices if not p.devices or d.name in p.devices]
             mmproj = pl.mmproj or None
             draft = self._draft_for(p)
-            if pl.source == "engine":
-                self.bus.activity_log(
-                    f"Engine projection: {'full GPU offload' if pl.full_offload else 'partial offload'}, "
-                    f"KV {pl.kv_k.upper()}, context {pl.ctx:,}", category="model")
+            self.bus.activity_log(f"{entry.id}: {describe_plan(pl)}", category="model", model=entry.id)
+            for w in pl.warnings:
+                self.bus.activity_log(f"{entry.id}: {w}", level="warn", category="model", model=entry.id)
             if self._shutting_down:  # planning can take a while; never start an engine during shutdown
                 raise ModelError("WinRunner is shutting down", 503, "shutting_down")
             port = free_port()
@@ -614,6 +638,22 @@ class ModelManager:
             if other:
                 raise ModelError(f"{other} has been loaded in the meantime", 409, "model_replaced")
 
+    async def _wait_for_release(self, names: list[str]) -> None:
+        """After unloading: wait until the GPUs' free memory stops growing (the driver frees VRAM with a delay)."""
+        if not names or await self.engine_async() is None:
+            return
+        deadline = time.monotonic() + RELEASE_WAIT_S
+        prev: dict[str, int] | None = None
+        while True:
+            devs, _ = await self.devices(max_age=0)
+            free = {d.name: d.free_mib for d in devs if d.name in names}
+            if prev is not None and all(free.get(n, 0) - prev.get(n, 0) < 64 for n in free):
+                return
+            prev = free
+            if time.monotonic() >= deadline:
+                return
+            await asyncio.sleep(0.3)
+
     async def _wait_for_devices(self, names: list[str]) -> None:
         """Wait until the engine sees the GPUs again and their free memory has settled.
 
@@ -805,10 +845,60 @@ class ModelManager:
                 "pending": list(self._pending.keys())}
 
 
+def describe_plan(pl: Plan) -> str:
+    """One line for the activity log: where the model goes."""
+    gpus = [d for d in pl.devices if d.layers or d.output_mib]
+    vram = " + ".join(f"{d.name} {d.used_mib / 1024:.1f}/{d.total_mib / 1024:.1f} GiB" for d in gpus)
+    ctx = f"context {pl.ctx:,}, KV {pl.kv_k.upper()}"
+    src = " (engine-measured)" if pl.source == "engine" else ""
+    if pl.strategy == "cpu":
+        return f"CPU only, {ctx}"
+    if pl.strategy == "full":
+        return f"full GPU offload{src}: {vram}, {ctx}"
+    if pl.strategy == "attention_first":
+        n = sum(1 for x in pl.ram_parts if x)
+        return (f"GPUs first{src}: {vram}; attention + KV cache of all layers on GPU, feed-forward weights of "
+                f"{n} layer(s) ({pl.totals.get('ram_parts_mib', 0) / 1024:.1f} GiB) in system RAM, {ctx}")
+    if pl.strategy == "layers":
+        cpu = sum(1 for x in pl.layer_home if x < 0)
+        return f"GPUs first{src}: {vram}; {cpu} leading layer(s) on the CPU, {ctx}"
+    if pl.strategy == "engine":
+        return f"llama.cpp --fit places the layers at load, {ctx}"
+    return f"manual: {pl.gpu_layers}/{pl.n_layer + 1} layers on GPU, {ctx}"
+
+
+def _quote(a: str) -> str:
+    import shlex
+
+    return a if IS_WINDOWS else shlex.quote(a)
+
+
+def _with_fit_on(args: list[str], eng: EngineInfo, margins: list[int]) -> list[str]:
+    """Launch arguments with llama.cpp's --fit on: it then prints its projection of the placement first."""
+    out = list(args)
+    if "--fit" in out:
+        i = out.index("--fit")
+        out[i + 1] = "on"
+    else:
+        out += ["--fit", "on"]
+    if margins and eng.has("--fit-target", "-fitt") and "--fit-target" not in out:
+        out += ["--fit-target", ",".join(str(int(m)) for m in margins)]
+    return out
+
+
+def _explicit_copy(pl: Plan) -> Plan:
+    import copy
+
+    q = copy.copy(pl)
+    q.use_engine_fit = False
+    return q
+
+
 def _run_capture(args: list[str], timeout: float) -> tuple[int, str]:
     try:
         r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                           timeout=timeout, cwd=os.path.dirname(args[0]) or None, creationflags=_CREATE_NO_WINDOW)
+                           timeout=timeout, cwd=os.path.dirname(args[0]) or None, env=engine_env(),
+                           creationflags=_CREATE_NO_WINDOW)
         out = r.stdout.decode("utf-8", errors="replace")
         if r.returncode != 0:
             out += "\n" + r.stderr.decode("utf-8", errors="replace")[-2000:]

@@ -357,6 +357,10 @@ class ModelInfo:
     tensor_types: dict[str, int]
     metadata_brief: dict[str, Any]
     error: str = ""
+    # Per layer: tensor groups that may be kept in system RAM while the rest of the layer (attention,
+    # norms, router, shared experts) and its KV cache stay on the GPU, as [group, bytes] in the order
+    # they stay on the GPU (dense FFN up/gate/down first, then routed experts). See planner.py.
+    layer_parts: list[list[list[Any]]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -405,6 +409,18 @@ def _int(v: Any, default: int = 0) -> int:
 _LAYER_RE = re.compile(r"^blk\.(\d+)\.")
 _EXPERT_RE = re.compile(r"\.ffn_(up|down|gate|gate_up)_(ch|)exps\.")
 _FFN_RE = re.compile(r"\.ffn_(up|down|gate|gate_up)\.")
+# Tensor groups that can live in system RAM apart from the rest of their layer (llama.cpp -ot patterns
+# "blk\.N\.<group>\." select exactly one group, including its .bias / .scale tensors).
+_PART_RE = re.compile(r"^blk\.\d+\.(ffn_(?:up|down|gate|gate_up)(?:_(?:ch|)exps)?)\.")
+# Order in which groups stay on the GPU when only part of a layer fits (mirrors llama.cpp's own
+# partial-layer order: up, then gate, then down): dense FFN before routed experts.
+_PART_ORDER = ["ffn_up", "ffn_gate_up", "ffn_gate", "ffn_down",
+               "ffn_up_exps", "ffn_up_chexps", "ffn_gate_up_exps", "ffn_gate_up_chexps",
+               "ffn_gate_exps", "ffn_gate_chexps", "ffn_down_exps", "ffn_down_chexps"]
+
+
+def _part_rank(group: str) -> int:
+    return _PART_ORDER.index(group) if group in _PART_ORDER else len(_PART_ORDER)
 
 
 def summarize(path: str | os.PathLike) -> ModelInfo:
@@ -444,6 +460,7 @@ def summarize(path: str | os.PathLike) -> ModelInfo:
     layer_bytes = [0] * n_layer
     layer_expert = [0] * n_layer
     layer_ffn = [0] * n_layer
+    layer_parts: list[dict[str, int]] = [{} for _ in range(n_layer)]
     token_embd = output = other = 0
     has_output = False
     n_params = 0
@@ -460,11 +477,15 @@ def summarize(path: str | os.PathLike) -> ModelInfo:
                 layer_bytes += [0] * grow
                 layer_expert += [0] * grow
                 layer_ffn += [0] * grow
+                layer_parts += [{} for _ in range(grow)]
             layer_bytes[il] += nb
             if _EXPERT_RE.search(t.name):
                 layer_expert[il] += nb
             elif _FFN_RE.search(t.name):
                 layer_ffn[il] += nb
+            pm = _PART_RE.match(t.name)
+            if pm:
+                layer_parts[il][pm.group(1)] = layer_parts[il].get(pm.group(1), 0) + nb
         elif t.name.startswith("token_embd."):
             token_embd += nb
         elif t.name.startswith("output.") and not t.name.startswith("output_norm"):
@@ -595,4 +616,6 @@ def summarize(path: str | os.PathLike) -> ModelInfo:
         other_bytes=other,
         tensor_types=type_hist,
         metadata_brief=brief,
+        layer_parts=[[[g, b] for g, b in sorted(parts.items(), key=lambda kv: _part_rank(kv[0]))]
+                     for parts in layer_parts],
     )

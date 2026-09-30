@@ -6,6 +6,7 @@ import ipaddress
 import re
 import secrets
 import socket
+import sys
 import time
 
 MiB = 1024 * 1024
@@ -53,6 +54,10 @@ def free_port(host: str = "127.0.0.1") -> int:
 
 def port_available(port: int, host: str = "0.0.0.0") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if sys.platform != "win32":
+            # like uvicorn's own socket: connections of a previous run in TIME_WAIT must not block a restart
+            # (a port another program listens on is still refused). On Windows the option means port sharing.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind((host, port))
             return True

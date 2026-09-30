@@ -96,8 +96,48 @@ export function actualDevices(inst, engineDevices) {
   return out;
 }
 
+/** Device index holding each layer's attention and KV cache (-1 = CPU), from a plan and, if known, the load. */
+function layerOwners(plan, loadInfo) {
+  const n = plan.n_layer;
+  const devs = plan.devices || [];
+  // WinRunner's own placement is exact (-ts layer counts and --override-tensor): the plan is what gets loaded.
+  if (plan.layer_home?.length === n && plan.strategy !== 'engine') return plan.layer_home.slice();
+  // llama.cpp --fit placed the layers: derive the split from the engine's actual buffers
+  let counts = devs.map((d) => d.layers || 0);
+  const buf = loadInfo?.buffers;
+  const off = loadInfo?.offload;
+  if (buf && off && devs.length > 1) {
+    const w = devs.map((d) => (buf[d.name]?.model || 0));
+    const tot = w.reduce((a, b) => a + b, 0);
+    const gpuLayers = Math.min(n, off.gpu_layers);
+    if (tot > 0) {
+      counts = w.map((x) => Math.round((x / tot) * gpuLayers));
+      counts[counts.length - 1] += gpuLayers - counts.reduce((a, b) => a + b, 0);
+    }
+  } else if (off && devs.length === 1) {
+    counts = [Math.min(n, off.gpu_layers)];
+  }
+  const owner = new Array(n).fill(-1);
+  let il = n - counts.reduce((a, b) => a + b, 0);
+  counts.forEach((c, di) => { for (let k = 0; k < c && il < n; k++) owner[il++] = di; });
+  return owner;
+}
+
+/** Tensor groups of each layer kept in system RAM (manual --n-cpu-moe / --n-cpu-ffn included). */
+function layerRamParts(plan) {
+  const n = plan.n_layer;
+  if (plan.ram_parts?.length === n) return plan.ram_parts;
+  const out = new Array(n).fill(null).map(() => []);
+  for (let i = 0; i < Math.min(n, plan.n_cpu_moe || 0); i++) out[i] = ['experts'];
+  for (let i = 0; i < Math.min(n, plan.n_cpu_ffn || 0); i++) out[i] = ['ffn_up', 'ffn_gate', 'ffn_down'];
+  return out;
+}
+
+const partLabel = (g) => g.replace(/^ffn_/, '').replace(/_(ch)?exps$/, ' experts').replace(/_/g, ' ');
+
 /**
- * Layer map: one block per transformer layer, coloured by the device holding it.
+ * Layer map: one block per transformer layer, coloured by the GPU holding its attention and KV cache.
+ * A lower grey band marks feed-forward (or expert) weights kept in system RAM.
  */
 export function layerMap() {
   const grid = h('div', { class: 'layermap' });
@@ -108,29 +148,10 @@ export function layerMap() {
     if (!plan || !plan.n_layer) { clear(grid); clear(legend); sig = ''; return; }
     const n = plan.n_layer;
     const devs = plan.devices || [];
-    // device for each layer; prefer the actual allocation when known
-    const owner = new Array(n).fill(-1);
-    let counts = devs.map((d) => d.layers || 0);
-    const buf = loadInfo?.buffers;
-    const off = loadInfo?.offload;
-    if (buf && off && devs.length > 1 && plan.source !== 'manual') {
-      const w = devs.map((d) => (buf[d.name]?.model || 0));
-      const tot = w.reduce((a, b) => a + b, 0);
-      const gpuLayers = Math.min(n, off.gpu_layers);
-      if (tot > 0) {
-        counts = w.map((x) => Math.round((x / tot) * gpuLayers));
-        const diff = gpuLayers - counts.reduce((a, b) => a + b, 0);
-        counts[counts.length - 1] += diff;
-      }
-    } else if (off && devs.length === 1) {
-      counts = [Math.min(n, off.gpu_layers)];
-    }
-    const gpuTotal = counts.reduce((a, b) => a + b, 0);
-    let il = n - gpuTotal;
-    counts.forEach((c, di) => { for (let k = 0; k < c && il < n; k++) owner[il++] = di; });
-    const moe = plan.n_cpu_moe || 0;
+    const owner = layerOwners(plan, loadInfo);
+    const ram = layerRamParts(plan);
     const lit = loading ? Math.floor(Math.max(0, Math.min(1, (progress - 0.12) / 0.72)) * n) : n;
-    const s = `${n}|${owner.join(',')}|${moe}|${lit}|${loading}`;
+    const s = `${n}|${owner.join(',')}|${ram.map((x) => x.length).join(',')}|${lit}|${loading}`;
     if (s === sig) return;
     const rebuild = sig.split('|')[0] !== String(n) || !grid.children.length;
     sig = s;
@@ -141,34 +162,45 @@ export function layerMap() {
       grid.appendChild(h('div', { class: 'lb out', 'data-tip': 'Output layer' }, 'O'));
     }
     const blocks = grid.children;
+    const moe = ram.some((x) => x.some((g) => g.includes('exps') || g === 'experts'));
     for (let i = 0; i < n; i++) {
       const b = blocks[i + 1];
       const d = owner[i];
       const color = d >= 0 ? `var(${DEV_COLORS[d % DEV_COLORS.length]})` : 'var(--c-other)';
-      const where = d >= 0 ? devs[d]?.name || `GPU${d}` : 'CPU';
-      if (d >= 0 && i < moe) {
-        b.style.background = `linear-gradient(to bottom, ${color} 0 45%, var(--c-other) 45% 100%)`;
-        b.dataset.tip = `Layer ${i}: attention on ${where}, expert weights in system RAM`;
+      const where = d >= 0 ? devs[d]?.name || `GPU${d}` : 'the CPU';
+      const parts = ram[i] || [];
+      if (d >= 0 && parts.length) {
+        // the RAM share grows with the number of matrices kept there (up, gate, down)
+        const top = Math.round(100 - Math.min(3, parts.length) * 18);
+        b.style.background = `linear-gradient(to bottom, ${color} 0 ${top}%, var(--c-other) ${top}% 100%)`;
+        b.dataset.tip = `Layer ${i}: attention and KV cache on ${where}; ${parts.map(partLabel).join(', ')} in system RAM`;
       } else {
         b.style.background = color;
-        b.dataset.tip = `Layer ${i}: ${where}`;
+        b.dataset.tip = d >= 0 ? `Layer ${i}: entirely on ${where}` : `Layer ${i}: on the CPU (weights, KV cache and attention in system RAM)`;
       }
-      const on = i < lit;
-      b.classList.toggle('off', !on);
+      b.classList.toggle('off', i >= lit);
       b.classList.toggle('cpu', d < 0);
     }
-    const outDev = gpuTotal > 0 ? counts.length - 1 : -1;
+    let outDev = devs.findIndex((d) => (d.output_mib || 0) > 0);
+    if (outDev < 0 && plan.gpu_layers > n) outDev = Math.max(-1, ...owner);
     const ob = blocks[n + 1];
     ob.style.background = outDev >= 0 ? `var(${DEV_COLORS[outDev % DEV_COLORS.length]})` : 'var(--c-other)';
+    ob.dataset.tip = `Output layer: ${outDev >= 0 ? devs[outDev]?.name || `GPU${outDev}` : 'CPU'}`;
     ob.classList.toggle('off', loading && lit < n);
     clear(legend);
-    counts.forEach((c, di) => {
+    devs.forEach((dv, di) => {
+      const c = owner.filter((x) => x === di).length;
       if (!c) return;
       legend.appendChild(h('span', null, h('i', { style: { background: `var(${DEV_COLORS[di % DEV_COLORS.length]})` } }),
-        `${devs[di]?.name || `GPU${di}`}: ${c} layers`));
+        `${dv.name || `GPU${di}`}: ${c} layers`));
     });
-    if (n - gpuTotal > 0) legend.appendChild(h('span', null, h('i', { style: { background: 'var(--c-other)' } }), `CPU: ${n - gpuTotal} layers`));
-    if (moe) legend.appendChild(h('span', null, h('i', { class: 'split' }), `${moe} layers with experts in RAM`));
+    const cpu = owner.filter((x) => x < 0).length;
+    if (cpu) legend.appendChild(h('span', null, h('i', { style: { background: 'var(--c-other)' } }), `CPU: ${cpu} layers`));
+    const split = ram.filter((x, i) => x.length && owner[i] >= 0).length;
+    if (split) {
+      legend.appendChild(h('span', { 'data-tip': 'Their attention and KV cache stay on the GPU' }, h('i', { class: 'split' }),
+        `${split} layers with ${moe ? 'expert' : 'feed-forward'} weights in RAM`));
+    }
   };
   return el;
 }

@@ -9,7 +9,7 @@ const KV_OPTS = [
   ['q5_1', 'Q5_1'], ['q5_0', 'Q5_0'], ['q4_1', 'Q4_1'], ['q4_0', 'Q4_0 (lossy, 28%)'], ['iq4_nl', 'IQ4_NL'], ['f32', 'F32'],
 ];
 const LOAD_MODES = [
-  ['auto', 'Auto (full read when fully offloaded, else memory-map)'], ['mmap', 'Memory-map (mmap)'], ['none', 'Full read (no mmap)'],
+  ['auto', 'Auto (full read unless whole layers run on the CPU)'], ['mmap', 'Memory-map (mmap)'], ['none', 'Full read (no mmap)'],
   ['mlock', 'Lock in RAM (mlock)'], ['mmap+mlock', 'Memory-map + lock'], ['dio', 'Direct I/O'],
 ];
 
@@ -81,8 +81,9 @@ export function loadForm(opts) {
     // ---- GPU offload ------------------------------------------------------
     sec('GPU offload');
     const manualBox = h('div', { class: 'col grow', style: { gap: '6px' } });
-    row('Allocation', 'gpu_offload', seg([['auto', 'Automatic', 'Fit layers, KV cache and buffers to free VRAM'], ['manual', 'Manual']],
-      v.gpu_offload, (x) => { set('gpu_offload', x); renderManual(); }), 'Automatic uses the memory planner and the engine\'s own projection.');
+    row('Allocation', 'gpu_offload', seg([['auto', 'Automatic', 'Fill every GPU to its free VRAM minus the safety margin, GPUs first'], ['manual', 'Manual']],
+      v.gpu_offload, (x) => { set('gpu_offload', x); renderManual(); }),
+      'Automatic fills each GPU up to the safety margin (Settings › Hardware, default 512 MiB). Attention and KV cache of every layer stay on the GPUs; only feed-forward weights that do not fit go to system RAM. The context is never reduced.');
     formRow(f, '', manualBox);
     const renderManual = () => {
       clear(manualBox);
@@ -97,6 +98,10 @@ export function loadForm(opts) {
       if (model?.is_moe || opts.mode === 'defaults') {
         manualBox.append(h('div', { class: 'row' }, h('span', { style: { width: '120px' }, 'data-tip': 'Expert weights of the first N layers stay in system RAM' }, 'MoE experts on CPU'),
           slideNum(v.n_cpu_moe, { min: 0, max: nLayer || 99, step: 1, width: 70 }, (x) => set('n_cpu_moe', x)), h('span', { class: 'dim' }, 'layers')));
+      }
+      if (!model?.is_moe || opts.mode === 'defaults') {
+        manualBox.append(h('div', { class: 'row' }, h('span', { style: { width: '120px' }, 'data-tip': 'Feed-forward weights of the first N layers stay in system RAM; their attention and KV cache stay on the GPU' }, 'FFN on CPU'),
+          slideNum(v.n_cpu_ffn || 0, { min: 0, max: nLayer || 99, step: 1, width: 70 }, (x) => set('n_cpu_ffn', x)), h('span', { class: 'dim' }, 'layers')));
       }
     };
     renderManual();
@@ -145,7 +150,7 @@ export function loadForm(opts) {
       'Fused attention kernel: far smaller compute buffers at long context. Required for a quantized V cache.',
       'Supported by the Vulkan and ROCm backends on RDNA2.');
     row('KV cache type', 'kv_cache_type', select(KV_OPTS, v.kv_cache_type, (x) => set('kv_cache_type', x), { style: { minWidth: '240px' } }),
-      'Precision of the attention key/value cache. Auto keeps F16 and uses Q8_0 only if that enables a full GPU offload.');
+      'Precision of the attention key/value cache. Auto keeps F16 when model and context fit in VRAM, otherwise Q8_0 (near-lossless, half the size) so more weights stay on the GPUs. The context length is unchanged.');
     row('V cache type', 'kv_cache_type_v', select([['', 'Same as K'], ...KV_OPTS.filter(([k]) => k !== 'auto')], v.kv_cache_type_v,
       (x) => set('kv_cache_type_v', x)), null, 'Separate precision for the value cache (advanced).');
     row('KV cache on GPU', 'kv_offload', toggle('Offload KV cache', v.kv_offload, (x) => set('kv_offload', x)), null,
@@ -166,7 +171,7 @@ export function loadForm(opts) {
     row('Threads', 'threads', h('div', { class: 'row' },
       input(v.threads, (x) => set('threads', Number(x) || 0), { type: 'number', cls: 'num', min: 0, max: 256, style: { width: '64px' } }), h('span', { class: 'dim' }, 'generation'),
       input(v.threads_batch, (x) => set('threads_batch', Number(x) || 0), { type: 'number', cls: 'num', min: 0, max: 256, style: { width: '64px' } }), h('span', { class: 'dim' }, 'batch')),
-      '0 = engine default (one thread per physical core). Only matters for layers running on the CPU.');
+      '0 = engine default: one thread per physical core (6 on a Ryzen 5 3600). Used for weights kept in system RAM.');
     row('Load mode', 'load_mode', select(LOAD_MODES, v.load_mode, (x) => set('load_mode', x), { style: { minWidth: '240px' } }));
 
     // ---- vision ----------------------------------------------------------------

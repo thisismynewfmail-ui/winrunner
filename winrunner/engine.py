@@ -56,6 +56,21 @@ def _plat_key() -> str:
     return "win" if IS_WINDOWS else "linux"
 
 
+def engine_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for llama.cpp processes."""
+    env = dict(os.environ)
+    if not IS_WINDOWS:
+        # Vulkan on Linux (RADV): give llama.cpp's buffers the highest residency priority, so that when the
+        # desktop or a browser needs VRAM the driver moves their memory to system RAM, not the model weights
+        # (weights in system RAM would be read over PCIe for every token).
+        env.setdefault("GGML_VK_ENABLE_MEMORY_PRIORITY", "1")
+        # AMD's own Vulkan driver (AMDVLK), if installed, hands over to Mesa's RADV: faster for llama.cpp
+        env.setdefault("AMD_VULKAN_ICD", "RADV")
+    if extra:
+        env.update(extra)
+    return env
+
+
 def _run(args: list[str], timeout: float = 30.0, cwd: str | None = None) -> tuple[int, str]:
     try:
         r = subprocess.run(
@@ -65,6 +80,7 @@ def _run(args: list[str], timeout: float = 30.0, cwd: str | None = None) -> tupl
             stdin=subprocess.DEVNULL,
             timeout=timeout,
             cwd=cwd,
+            env=engine_env(),
             creationflags=_CREATE_NO_WINDOW,
         )
         return r.returncode, strip_ansi(r.stdout.decode("utf-8", errors="replace"))
@@ -315,6 +331,36 @@ class EngineManager:
 
     # ----- installation -----------------------------------------------------------
 
+    def _release_entry(self, rel: dict[str, Any]) -> dict[str, Any]:
+        assets = [
+            {"name": a["name"], "size": a.get("size", 0), "url": a["browser_download_url"]}
+            for a in rel.get("assets", [])
+        ]
+        return {
+            "tag": rel.get("tag_name", ""),
+            "published": rel.get("published_at", ""),
+            "prerelease": rel.get("prerelease", False),
+            "assets": assets,
+            "backends": {b: self.pick_asset(assets, b) for b in ("vulkan", "rocm", "cpu")},
+        }
+
+    async def _guessed_release(self, c: httpx.AsyncClient, tag: str) -> dict[str, Any]:
+        """Release entry built from the official asset names (when the GitHub API is unavailable)."""
+        ext = ".zip" if IS_WINDOWS else ".tar.gz"
+        plat = "win" if IS_WINDOWS else "ubuntu"
+        guesses = {
+            "vulkan": f"llama-{tag}-bin-{plat}-vulkan-x64{ext}",
+            "cpu": f"llama-{tag}-bin-{plat}-{'cpu-' if IS_WINDOWS else ''}x64{ext}",
+        }
+        assets = []
+        for name in guesses.values():
+            url = f"{GITHUB_WEB}/releases/download/{tag}/{name}"
+            h = await c.head(url)
+            if h.status_code < 400:
+                assets.append({"name": name, "size": int(h.headers.get("content-length", 0)), "url": url})
+        return {"tag": tag, "published": "", "prerelease": False, "assets": assets,
+                "backends": {b: self.pick_asset(assets, b) for b in ("vulkan", "rocm", "cpu")}}
+
     async def releases(self, limit: int = 8) -> list[dict[str, Any]]:
         """Recent releases with assets matching this platform."""
         headers = {"Accept": "application/vnd.github+json", "User-Agent": "WinRunner"}
@@ -322,22 +368,7 @@ class EngineManager:
             try:
                 r = await c.get(f"{GITHUB_API}/releases", params={"per_page": limit})
                 r.raise_for_status()
-                out = []
-                for rel in r.json():
-                    assets = [
-                        {"name": a["name"], "size": a.get("size", 0), "url": a["browser_download_url"]}
-                        for a in rel.get("assets", [])
-                    ]
-                    out.append(
-                        {
-                            "tag": rel.get("tag_name", ""),
-                            "published": rel.get("published_at", ""),
-                            "prerelease": rel.get("prerelease", False),
-                            "assets": assets,
-                            "backends": {b: self.pick_asset(assets, b) for b in ("vulkan", "rocm", "cpu")},
-                        }
-                    )
-                return out
+                return [self._release_entry(rel) for rel in r.json()]
             except (httpx.HTTPError, ValueError, KeyError) as exc:
                 log.warning("GitHub API unavailable (%s); falling back to release redirect", exc)
             # Fallback: find the latest tag from the web redirect and guess asset names.
@@ -346,21 +377,26 @@ class EngineManager:
             m = re.search(r"/tag/([^/?#]+)", loc)
             if not m:
                 raise RuntimeError("could not determine the latest llama.cpp release")
-            tag = m.group(1)
-            ext = ".zip" if IS_WINDOWS else ".tar.gz"
-            plat = "win" if IS_WINDOWS else "ubuntu"
-            guesses = {
-                "vulkan": f"llama-{tag}-bin-{plat}-vulkan-x64{ext}",
-                "cpu": f"llama-{tag}-bin-{plat}-{'cpu-' if IS_WINDOWS else ''}x64{ext}",
-            }
-            assets = []
-            for name in guesses.values():
-                url = f"{GITHUB_WEB}/releases/download/{tag}/{name}"
-                h = await c.head(url)
-                if h.status_code < 400:
-                    assets.append({"name": name, "size": int(h.headers.get("content-length", 0)), "url": url})
-            return [{"tag": tag, "published": "", "prerelease": False, "assets": assets,
-                     "backends": {b: self.pick_asset(assets, b) for b in ("vulkan", "rocm", "cpu")}}]
+            return [await self._guessed_release(c, m.group(1))]
+
+    async def release(self, tag: str) -> dict[str, Any]:
+        """One release by tag (e.g. b11269), with assets matching this platform."""
+        if not re.match(r"^[\w.+-]{1,64}$", tag):
+            raise ValueError(f"invalid release tag {tag!r}")
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "WinRunner"}
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as c:
+            try:
+                r = await c.get(f"{GITHUB_API}/releases/tags/{tag}")
+                if r.status_code == 404:
+                    raise RuntimeError(f"llama.cpp release {tag} does not exist")
+                r.raise_for_status()
+                return self._release_entry(r.json())
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                log.warning("GitHub API unavailable (%s); using the official asset names for %s", exc, tag)
+            rel = await self._guessed_release(c, tag)
+            if not rel["assets"]:
+                raise RuntimeError(f"no downloads found for llama.cpp release {tag}")
+            return rel
 
     @staticmethod
     def pick_asset(assets: list[dict[str, Any]], backend: str) -> dict[str, Any] | None:
@@ -415,7 +451,7 @@ class EngineManager:
                 raise RuntimeError("archive did not contain llama-server")
             if not IS_WINDOWS:
                 for p in server.parent.iterdir():
-                    if p.is_file() and (p.name.startswith("llama-") or p.name.startswith("rpc-") or p.name == "llama"):
+                    if p.is_file() and (p.name.startswith(("llama-", "rpc-", "ggml-rpc")) or p.name == "llama"):
                         p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
             manifest = {"tag": tag, "backend": backend, "asset": asset["name"], "installed_at": time.time(),
                         "server": str(server.relative_to(target))}

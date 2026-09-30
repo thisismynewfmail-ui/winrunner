@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any
@@ -103,14 +104,41 @@ def recommendations(sysinfo: dict[str, Any]) -> list[dict[str, str]]:
                             "for generation (one per physical core); with full GPU offload the CPU only schedules "
                             "work, so more threads do not help."})
     gpus = [g for g in sysinfo.get("gpus") or [] if g.get("vendor") in ("AMD", "NVIDIA", "Intel")]
+    linux = sys.platform.startswith("linux")
     if len(gpus) >= 2:
         names = {g["name"] for g in gpus}
         out.append({"title": "Multi-GPU layer split",
                     "text": f"{len(gpus)} GPUs detected ({', '.join(sorted(names))}). Models are split by layer "
                             "(pipeline) across GPUs; only small activations cross the PCIe bus, so a secondary slot "
-                            "running at x4 costs little. Row split is not recommended on consumer boards. The tensor "
-                            "split is computed per model from free VRAM, the output layer and the KV cache."})
-    if any(g.get("vendor") == "AMD" for g in gpus):
+                            "running at x4 costs little for generation. Row split is not recommended on consumer "
+                            "boards. Each GPU gets as many layers as fit in its free VRAM minus the margin; the "
+                            "output layer goes to the last GPU."})
+        slow = [g for g in gpus if "x4" in (g.get("pcie") or "") or "x1 " in (g.get("pcie") or "") + " "]
+        if linux and slow and any(g not in slow for g in gpus):
+            out.append({"title": "PCIe slots",
+                        "text": "; ".join(f"{g['name']} ({g.get('pci') or g.get('id')}): {g.get('pcie')}" for g in gpus)
+                                + ". When weights are kept in system RAM, llama.cpp streams them to the first GPU "
+                                  "(Vulkan0) for long prompts: that GPU should sit in the x16 slot."})
+    if linux and any(g.get("vendor") == "AMD" for g in gpus):
+        drv = sysinfo.get("vulkan_driver")
+        out.append({"title": "Backend",
+                    "text": "Vulkan with Mesa's RADV driver" + (f" ({drv})" if drv else "") + " is the recommended "
+                            "backend for Radeon GPUs on Linux: flash attention, quantized KV cache and multi-GPU all "
+                            "work, and it needs no ROCm install. WinRunner forces RADV if AMD's AMDVLK driver is "
+                            "also installed, and asks the driver to keep the model's memory resident in VRAM."})
+        no_bar = [g for g in gpus if g.get("rebar") is False]
+        if no_bar:
+            out.append({"title": "Resizable BAR",
+                        "text": f"Resizable BAR is off for {', '.join(g['name'] for g in no_bar)}: the CPU can only map a "
+                                "256 MiB window of VRAM, which slows model loading and weight streaming. Enable "
+                                "\"Above 4G decoding\" and \"Re-Size BAR support\" in the BIOS (Ryzen 3000 + "
+                                "B450/B550/X570 boards support it with a current BIOS)."})
+        ra = sysinfo.get("render_access") or {}
+        if ra.get("nodes") and not ra.get("accessible"):
+            out.append({"title": "GPU access",
+                        "text": "This user cannot open the GPU render devices (/dev/dri/renderD*). Run "
+                                "\"sudo usermod -aG render,video $USER\" (setup.sh does this), then log out and back in."})
+    elif any(g.get("vendor") == "AMD" for g in gpus):
         out.append({"title": "Backend",
                     "text": "Vulkan is the default for Radeon GPUs on Windows: it needs only the Adrenalin driver, "
                             "supports flash attention, quantized KV cache and multi-GPU. The ROCm (HIP) build can "
@@ -118,8 +146,8 @@ def recommendations(sysinfo: dict[str, Any]) -> list[dict[str, str]]:
     ram = sysinfo.get("ram_total") or 0
     if ram >= 48 * GiB:
         out.append({"title": "System memory",
-                    "text": f"{ram / GiB:.0f} GiB RAM: large mixture-of-experts models that exceed VRAM keep expert "
-                            "weights in system RAM automatically while attention and KV cache stay on the GPUs. "
+                    "text": f"{ram / GiB:.0f} GiB RAM: models larger than the VRAM keep only feed-forward (or expert) "
+                            "weights in system RAM while attention and the KV cache of every layer stay on the GPUs. "
                             "The prompt cache (8 GiB default) keeps recent conversations for instant reuse."})
     tdr = sysinfo.get("gpu_timeout")
     if gpus and tdr_limited(tdr):
@@ -132,9 +160,9 @@ def recommendations(sysinfo: dict[str, Any]) -> list[dict[str, str]]:
     total_vram = sum(g.get("vram_total") or 0 for g in gpus)
     if total_vram:
         out.append({"title": "Context length and KV cache",
-                    "text": f"{total_vram / GiB:.0f} GiB total VRAM. WinRunner keeps the KV cache at F16 when the "
-                            "requested context fits and switches to Q8_0 (near-lossless, half the size) only when that "
-                            "is what allows the whole model to stay on the GPUs."})
+                    "text": f"{total_vram / GiB:.0f} GiB total VRAM. The context you set is always used as set. "
+                            "The KV cache stays F16 when model and context fit in VRAM; otherwise Q8_0 "
+                            "(near-lossless, half the size) keeps more weights on the GPUs."})
     return out
 
 

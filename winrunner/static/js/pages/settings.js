@@ -127,6 +127,8 @@ export function mount(root) {
   // ================= ENGINE =================
   const installBar = h('div', { class: 'progress' }, h('div', { class: 'fill' }));
   const installTxt = h('div', { class: 'dim' });
+  const isWin = () => store.status?.platform === 'win32';
+
   async function renderEngine() {
     const host = hosts.engine;
     clear(host);
@@ -137,7 +139,7 @@ export function mount(root) {
     const activeBox = a ? h('div', null,
       kv([['Engine', `llama.cpp ${a.version}${a.build ? ` (build ${a.build})` : ''}${a.commit ? ` · ${a.commit}` : ''}`], ['Backend', a.backend_label],
         ['Executable', h('code', null, a.path)], ['Options detected', `${a.flag_count} command-line options`],
-        ['Memory projection', a.fit_params ? 'llama-fit-params available' : 'not included in this build'],
+        ['Memory projection', a.flags?.includes('--fit') ? 'llama-server --fit projection (measures every plan)' : a.fit_params ? 'llama-fit-params' : 'not available in this build (estimates only)'],
         ['Benchmark tool', a.bench ? 'llama-bench available' : 'not included'], ['Flash attention flag', a.fa_tristate ? 'on / off / auto' : 'boolean (older build)']]),
       a.probe_error ? h('div', { class: 'note err' }, a.probe_error) : null,
       h('div', { class: 'row', style: { marginTop: '8px' } }, btn('Re-detect engine and devices', async () => {
@@ -145,7 +147,8 @@ export function mount(root) {
         toast(`${r.devices.length} device(s): ${r.devices.map((x) => x.name).join(', ') || 'none'}`, 'ok');
         renderEngine(); renderHardware();
       }, { icon: 'refresh' })))
-      : h('div', { class: 'note warn' }, 'No llama.cpp engine installed. Download one below (Vulkan is recommended for AMD Radeon GPUs on Windows).');
+      : h('div', { class: 'note warn' }, isWin() ? 'No llama.cpp engine installed. Download one below (Vulkan is recommended for AMD Radeon GPUs on Windows).'
+        : 'No llama.cpp engine installed. Run ./setup.sh again, or download the Vulkan build below (it uses the Mesa RADV driver).');
     const tb = h('tbody');
     for (const e of d.installed) {
       const isActive = a && a.path === e.server;
@@ -167,7 +170,8 @@ export function mount(root) {
         const rel = r.releases.find((x) => !x.prerelease) || r.releases[0];
         if (!rel) { relBox.appendChild(h('div', { class: 'dim' }, 'No releases found.')); return; }
         relBox.appendChild(h('div', { style: { marginBottom: '6px' } }, `Latest release: `, h('b', null, rel.tag), rel.published ? h('span', { class: 'dim' }, ` · ${rel.published.slice(0, 10)}`) : null));
-        const labels = { vulkan: 'Vulkan (recommended for Radeon on Windows)', rocm: 'ROCm / HIP (needs the AMD HIP SDK installed)', cpu: 'CPU only' };
+        const labels = isWin() ? { vulkan: 'Vulkan (recommended for Radeon on Windows)', rocm: 'ROCm / HIP (needs the AMD HIP SDK installed)', cpu: 'CPU only' }
+          : { vulkan: 'Vulkan (recommended: Mesa RADV driver)', rocm: 'ROCm / HIP (not published for Linux)', cpu: 'CPU only' };
         for (const b of ['vulkan', 'rocm', 'cpu']) {
           const asset = rel.backends[b];
           relBox.appendChild(h('div', { class: 'row', style: { margin: '3px 0' } }, h('span', { style: { width: '300px' } }, labels[b]),
@@ -178,21 +182,27 @@ export function mount(root) {
         }
       } catch (e) { clear(relBox); relBox.appendChild(h('div', { class: 'note err' }, e.message)); } finally { relBtn.disabled = false; }
     }, { icon: 'download' });
-    const custom = input(es.engine_path, null, { placeholder: 'Path to llama-server.exe or its folder (e.g. a custom HIP build)', cls: 'grow mono' });
+    const custom = input(es.engine_path, null, { placeholder: isWin() ? 'Path to llama-server.exe or its folder (e.g. a custom HIP build)' : 'Path to llama-server or its folder (e.g. ~/llama.cpp/build/bin, a custom ROCm build)', cls: 'grow mono' });
     const f = h('div', { class: 'form' });
     formRow(f, 'Process priority', select([['normal', 'Normal'], ['above_normal', 'Above normal (recommended)'], ['high', 'High']], es.process_priority,
-      (v) => save({ engine: { process_priority: v } }, 'Priority saved - applies to the next load')));
+      (v) => save({ engine: { process_priority: v } }, 'Priority saved - applies to the next load')),
+      isWin() ? null : 'On Linux a raised priority needs permission to lower the nice value (limits.conf); otherwise the engine runs at normal priority.');
     formRow(f, 'Engine log detail', select([[3, 'Normal'], [4, 'Detailed (recommended: buffer sizes, slots)'], [5, 'Debug']], es.log_verbosity,
       (v) => save({ engine: { log_verbosity: Number(v) } })));
-    formRow(f, 'Engine memory fitting', toggle('Let llama.cpp fit layers to free VRAM in automatic mode', es.use_engine_fit, (v) => save({ engine: { use_engine_fit: v } })),
-      'Uses the engine\'s exact allocator projection (--fit) within the configured VRAM margins.');
+    formRow(f, 'Automatic placement', seg([['gpu_first', 'GPU first (recommended)', 'Fill every GPU to its free VRAM minus the margin; attention and KV cache of all layers stay on the GPUs, only feed-forward weights overflow to system RAM'],
+      ['engine', 'llama.cpp --fit', 'The engine decides at load time and moves whole layers (with their KV cache) to the CPU']], es.placement,
+    (v) => save({ engine: { placement: v } }, 'Placement saved - applies to the next load')),
+      'GPU first keeps the slow part (attention over the whole context) on the GPUs, which is what makes long prompts fast.');
+    formRow(f, 'Measure with the engine', toggle('Check every automatic plan with the engine\'s own allocator before loading', es.use_engine_fit, (v) => save({ engine: { use_engine_fit: v } })),
+      'llama-server projects its exact memory use and stops before reading the weights (a few seconds); the plan is then adjusted so each GPU ends at the margin.');
     formRow(f, 'Load timeout', h('div', { class: 'row' }, input(es.load_timeout_s, (v) => save({ engine: { load_timeout_s: Number(v) } }), { type: 'number', cls: 'num', min: 30 }),
       h('span', { class: 'dim' }, 'seconds')));
     host.append(group('Engine', [activeBox], { icon: 'server' }),
       group('Installed engines', d.installed.length ? h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' }, h('thead', null, h('tr', null,
         h('th', null, 'Name'), h('th', null, 'Backend'), h('th', null, 'Release'), h('th', null, 'Installed'), h('th'))), tb)) : h('div', { class: 'dim' }, 'None.'),
       { icon: 'list' }),
-      group('Download llama.cpp', [h('p', { class: 'dim' }, 'Official release builds from github.com/ggml-org/llama.cpp. The Vulkan build needs only the graphics driver. The ROCm build bundles the HIP runtime but loads rocBLAS from the AMD HIP SDK, which must be installed separately.'),
+      group('Download llama.cpp', [h('p', { class: 'dim' }, isWin() ? 'Official release builds from github.com/ggml-org/llama.cpp. The Vulkan build needs only the graphics driver. The ROCm build bundles the HIP runtime but loads rocBLAS from the AMD HIP SDK, which must be installed separately.'
+        : 'Official Ubuntu builds from github.com/ggml-org/llama.cpp (they run on Linux Mint 22). The Vulkan build needs only the Mesa RADV driver installed by setup.sh. setup.sh installs the pinned release b11269; newer releases can be tried here and switched back in the table above.'),
         relBtn, relBox, h('div', { style: { marginTop: '8px' } }, installBar, installTxt)], { icon: 'download' }),
       group('Custom engine', [h('div', { class: 'row' }, custom, btn('Use', async () => {
         try { await api.post(wr('/engine/select'), { path: custom.value.trim() }); toast('Custom engine selected', 'ok'); renderEngine(); } catch (e) { toast(e.message, 'err'); }
@@ -237,7 +247,7 @@ export function mount(root) {
     }
     const f = h('div', { class: 'form' });
     formRow(f, 'VRAM safety margin', h('div', { class: 'row' }, input(hw.vram_margin_mib, (v) => save({ hardware: { vram_margin_mib: Number(v) } }), { type: 'number', cls: 'num', min: 0, step: 128 }),
-      h('span', { class: 'dim' }, 'MiB per GPU')), 'Kept free on every GPU for the desktop, browser and driver. Per-device values can be set in the table above.');
+      h('span', { class: 'dim' }, 'MiB per GPU')), 'Left free on every GPU after the model is loaded (default 512 MiB: a 16 GB card ends at about 15.5 GiB used). Per-device values can be set in the table above.');
     formRow(f, 'Telemetry interval', select([[0.5, '0.5 s'], [1, '1 s'], [2, '2 s'], [5, '5 s']], hw.telemetry_interval_s, (v) => save({ hardware: { telemetry_interval_s: Number(v) } })));
     host.append(
       group('System', kv([['Operating system', sys.os], ['Processor', `${sys.cpu} · ${sys.cores_physical} cores / ${sys.cores_logical} threads`],
@@ -248,7 +258,8 @@ export function mount(root) {
         : h('div', { class: 'dim' }, 'No discrete GPUs reported.'), { icon: 'chip' }),
       group('Engine devices', [(d.engine_devices || []).length ? h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' }, h('thead', null, h('tr', null,
         ['Device', 'Description', 'Total', 'Free now', 'Backend details', 'Margin MiB'].map((x, i) => h('th', { class: i === 2 || i === 3 ? 'num' : '' }, x)))), dtb))
-        : h('div', { class: 'note warn' }, d.device_error || 'The engine reports no GPU devices. Check the graphics driver (Vulkan) or install the ROCm build.'), h('div', { class: 'divider' }), f],
+        : h('div', { class: 'note warn' }, d.device_error || (isWin() ? 'The engine reports no GPU devices. Check the graphics driver (Vulkan) or install the ROCm build.'
+          : 'The engine reports no GPU devices. Check "vulkaninfo --summary" and that you are in the render and video groups (log out and in after setup.sh).')), h('div', { class: 'divider' }), f],
       { icon: 'mem' }),
       group('Optimisation notes for this PC', (d.recommendations || []).map((r) => h('div', { class: 'rec' }, h('b', null, r.title), r.text)), { icon: 'bolt' }));
   }
@@ -280,8 +291,8 @@ export function mount(root) {
     const f = h('div', { class: 'form' });
     formRow(f, 'Model folders', h('div', { class: 'col', style: { gap: '3px' } }, l.model_dirs.map((d) => h('code', null, d)),
       btn('Manage folders', () => openFolders(), { icon: 'folder', cls: 'small' })));
-    formRow(f, 'Download folder', input(l.download_dir, (v) => save({ library: { download_dir: v } }), { cls: 'grow mono', placeholder: 'default: <install>\\models' }),
-      'Models downloaded from Hugging Face are saved here (publisher\\repository\\file.gguf).');
+    formRow(f, 'Download folder', input(l.download_dir, (v) => save({ library: { download_dir: v } }), { cls: 'grow mono', placeholder: isWin() ? 'default: <install>\\models' : 'default: <install>/models' }),
+      `Models downloaded from Hugging Face are saved here (${isWin() ? 'publisher\\repository\\file.gguf' : 'publisher/repository/file.gguf'}).`);
     formRow(f, 'Hugging Face token', input(l.hf_token, (v) => save({ library: { hf_token: v } }), { type: 'password', cls: 'grow mono', placeholder: 'hf_... (only for gated repositories)' }));
     host.append(group('Storage', f, { icon: 'folder' }));
   }

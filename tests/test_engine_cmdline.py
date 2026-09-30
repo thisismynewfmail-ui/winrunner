@@ -16,6 +16,8 @@ HELP_NEW = """
 -fit,  --fit [on|off]                   whether to adjust unset arguments to fit in device memory
 -fitt, --fit-target MiB0,MiB1,MiB2,...
 -ncmoe, --n-cpu-moe N                   keep the Mixture of Experts (MoE) weights of the first N layers in the
+-ncffn, --n-cpu-ffn N                   keep the dense FFN weights of the first N layers in the CPU
+-ot,   --override-tensor <tensor name pattern>=<buffer type>,...
 --mmproj-offload, --no-mmproj-offload   whether to enable GPU offloading for multimodal projector (default:
 -mm,   --mmproj FILE                    path to a multimodal projector file.
 --spec-type none,draft-simple,ngram-simple
@@ -149,7 +151,38 @@ def test_manual_moe_override_tensor_fallback():
     p = LoadParams(gpu_offload="manual", n_cpu_moe=2)
     pl, names = _plan(p, False)
     a = build_server_args(eng, "/m/x.gguf", p, pl, names, 1, "m", "", None, None, None, False, 4, []).args
-    assert "-ot" in a and "blk\\.0\\.ffn_(up|down|gate)_exps=CPU" in a[a.index("-ot") + 1]
+    assert "-ot" in a
+    pat = a[a.index("-ot") + 1]
+    assert pat.startswith("blk\\.(0|1)\\.(") and "ffn_up_exps" in pat and pat.endswith("=CPU")
+
+
+def test_manual_mode_turns_engine_fit_off():
+    eng = engine_from_help(HELP_NEW)
+    p = LoadParams(gpu_offload="manual", n_gpu_layers=10, n_cpu_ffn=3)
+    pl, names = _plan(p, False)
+    a = build_server_args(eng, "/m/x.gguf", p, pl, names, 1, "m", "", None, None, None, False, 4, [512, 512]).args
+    assert a[a.index("--fit") + 1] == "off" and a[a.index("-ngl") + 1] == "10"
+    assert a[a.index("--n-cpu-ffn") + 1] == "3"
+
+
+def test_server_args_gpu_first_explicit_placement():
+    """Automatic placement: explicit layers / split / weights in RAM; --fit only checks the projection."""
+    from tests.test_planner import RX6800, _big_dense
+
+    eng = engine_from_help(HELP_NEW)
+    p = LoadParams(context_length=65536)
+    pl = Planner(_big_dense(), p, RX6800).plan()
+    assert pl.strategy == "attention_first"
+    a = build_server_args(eng, "/m/x.gguf", p, pl, [d.name for d in RX6800], 1, "m", "", None, None, None, False, 4,
+                          [512, 512]).args
+    assert a[a.index("-ngl") + 1] == "all"
+    ts = [int(x) for x in a[a.index("-ts") + 1].split(",")]
+    assert sum(ts) == pl.n_layer + 1
+    ot = a[a.index("-ot") + 1]
+    assert ot == ",".join(pl.overrides) and "=CPU" in ot
+    assert a[a.index("--fit") + 1] == "on" and a[a.index("--fit-target") + 1] == "512,512"
+    assert a[a.index("--load-mode") + 1] == "none"
+    assert a[a.index("-c") + 1] == "65536"  # the requested context, unchanged
 
 
 def test_template_override_and_extra_args():
@@ -163,12 +196,26 @@ def test_template_override_and_extra_args():
 
 def test_fit_and_bench_args():
     eng = engine_from_help(HELP_NEW, fit_params="/e/llama-fit-params", bench="/e/llama-bench")
-    p = LoadParams(context_length=8192)
+    p = LoadParams(context_length=8192, parallel=4)
     pl, names = _plan(p, True)
     fa = build_fit_args(eng, "/m/x.gguf", p, pl, names, [1024, 1024], print_mode=False)
     assert fa[0] == "/e/llama-fit-params" and "--fit-target" in fa and "-ngl" not in fa
     fp = build_fit_args(eng, "/m/x.gguf", p, pl, names, [1024, 1024], print_mode=True)
     assert fp[-2:] == ["--fit-print", "on"] and "-ngl" in fp
-    b = build_bench_args(eng, "/m/x.gguf", p, pl, names, "512", "128", "0", 3)
+    assert "-np" not in fp  # a single sequence measures the server's unified KV cache
+    b = build_bench_args(eng, "/m/x.gguf", p, pl, names, "512", "128", "0", 3, threads=6)
     assert b[0] == "/e/llama-bench" and "-o" in b and b[b.index("-o") + 1] == "json"
     assert "/" in b[b.index("-ts") + 1]  # llama-bench uses '/' separators
+    assert b[b.index("-t") + 1] == "6"  # same threads as the server (llama-bench defaults to 4)
+
+
+def test_bench_args_keep_weights_in_ram_like_the_server():
+    from tests.test_planner import RX6800, _big_dense
+
+    eng = engine_from_help(HELP_NEW, bench="/e/llama-bench")
+    p = LoadParams(context_length=32768)
+    pl = Planner(_big_dense(), p, RX6800).plan()
+    b = build_bench_args(eng, "/m/x.gguf", p, pl, [d.name for d in RX6800], "512", "128", "0", 3)
+    ot = b[b.index("-ot") + 1]
+    assert ot == ";".join(pl.overrides)  # llama-bench separates overrides of one test with ';'
+    assert b[b.index("-lm") + 1] == "none"

@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 import threading
 import time
 import webbrowser
 
 from . import PRODUCT_NAME, __version__
-from .paths import DataPaths
+from .paths import STATIC_DIR, DataPaths
 
 
 def _setup_logging(level: str, paths: DataPaths) -> None:
@@ -40,7 +41,7 @@ def _setup_logging(level: str, paths: DataPaths) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def _install_engine(paths: DataPaths, backend: str) -> int:
+def _install_engine(paths: DataPaths, backend: str, tag: str | None = None) -> int:
     from .config import SettingsStore
     from .engine import EngineManager
 
@@ -49,7 +50,15 @@ def _install_engine(paths: DataPaths, backend: str) -> int:
     store = SettingsStore(paths.settings_file)
 
     async def run() -> int:
-        rels = await em.releases(limit=3)
+        if tag:
+            existing = next((e for e in em.installed() if e["tag"] == tag and e["backend"] == backend), None)
+            if existing:
+                store.update({"engine": {"active_engine": existing["name"], "engine_path": "", "backend": backend}})
+                print(f"llama.cpp {tag} ({backend}) is already installed: {existing['server']}")
+                return 0
+            rels = [await em.release(tag)]
+        else:
+            rels = await em.releases(limit=3)
         for rel in rels:
             asset = rel["backends"].get(backend)
             if asset:
@@ -67,28 +76,155 @@ def _install_engine(paths: DataPaths, backend: str) -> int:
                 store.update({"engine": {"active_engine": res["name"], "engine_path": "", "backend": backend}})
                 print(f"Installed: {res['server']}")
                 return 0
-        print(f"No {backend} build found in the latest releases.", file=sys.stderr)
+        where = f"release {tag}" if tag else "the latest releases"
+        print(f"No {backend} build for this platform found in {where}.", file=sys.stderr)
         return 1
 
     return asyncio.run(run())
+
+
+def _check(paths: DataPaths) -> int:
+    """Print the engine and the GPUs it can use (setup.sh runs this after installing)."""
+    from pathlib import Path
+
+    from .config import SettingsStore
+    from .engine import EngineManager
+    from .hardware import HardwareMonitor
+
+    store = SettingsStore(paths.settings_file)
+    es = store.settings.engine
+    em = EngineManager(paths.engines_dir, paths.downloads_tmp)
+    server = em.resolve_server(es.engine_path, es.active_engine, es.backend)
+    if server is None:
+        print("No llama.cpp engine installed.")
+        return 1
+    info = em.probe(Path(server))
+    print(f"Engine:  llama.cpp {info.version} (build {info.build}, {info.backend}) - {server}")
+    if info.probe_error:
+        print(f"         problem: {info.probe_error}")
+    devices, err = em.list_devices(Path(server))
+    mon = HardwareMonitor()
+    sysinfo = mon.system_info()
+    if sysinfo.get("vulkan_driver"):
+        print(f"Driver:  Mesa (RADV) {sysinfo['vulkan_driver']}")
+    mapping = mon.map_engine_devices([{"name": d.name, "description": d.description, "total_mib": d.total_mib,
+                                       "free_mib": d.free_mib} for d in devices])
+    gpus = {g.id: g for g in mon.gpus}
+    for d in devices:
+        g = gpus.get(mapping.get(d.name, ""))
+        extra = ""
+        if g is not None:
+            bits = [g.pci, g.pcie, "display" if g.boot_vga else "",
+                    "Resizable BAR on" if g.rebar else "Resizable BAR off" if g.rebar is False else ""]
+            extra = " - " + ", ".join(b for b in bits if b)
+        print(f"GPU:     {d.name}: {d.description} - {d.free_mib:,} of {d.total_mib:,} MiB free{extra}")
+    if not devices:
+        print("GPU:     none visible to the engine" + (f" ({err.strip().splitlines()[-1]})" if err.strip() else ""))
+        acc = sysinfo.get("render_access") or {}
+        if acc.get("nodes") and not acc.get("accessible"):
+            print("         No access to /dev/dri/renderD*: log out and back in (new 'render' group membership).")
+        return 1
+    return 0
 
 
 WINDOW_LOAD_TIMEOUT = 25.0
 WEBVIEW2_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 
 
+LINUX_WINDOW_PACKAGES = "python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-webkit2-4.1"
+
+
+def _linux_gui() -> str | None:
+    """pywebview backend available on this Linux desktop: 'gtk' (WebKit2GTK), 'qt' or None."""
+    try:
+        import gi  # type: ignore
+
+        gi.require_version("Gtk", "3.0")
+        for ver in ("4.1", "4.0"):
+            try:
+                gi.require_version("WebKit2", ver)
+                from gi.repository import Gtk, WebKit2  # type: ignore  # noqa: F401
+
+                return "gtk"
+            except (ValueError, ImportError):
+                continue
+    except (ImportError, ValueError):
+        pass
+    try:
+        import qtpy  # type: ignore  # noqa: F401
+        from qtpy import QtWebEngineWidgets  # type: ignore  # noqa: F401
+
+        return "qt"
+    except Exception:
+        return None
+
+
+def _window_icon(gui: str | None) -> str | None:
+    """Icon file for the app window that the toolkit can actually read.
+
+    GTK reads SVG only through the optional librsvg pixbuf loader, and pywebview leaves the window hidden when
+    the icon cannot be loaded, so the PNG comes first and every candidate is test-loaded.
+    """
+    if gui not in ("gtk", "qt"):
+        return None
+    for name in ("icon.png", "icon.svg"):
+        path = STATIC_DIR / "img" / name
+        if not path.is_file():
+            continue
+        if gui == "gtk":
+            try:
+                import gi  # type: ignore
+
+                gi.require_version("GdkPixbuf", "2.0")
+                from gi.repository import GdkPixbuf  # type: ignore
+
+                GdkPixbuf.Pixbuf.new_from_file(str(path))
+            except Exception:
+                continue
+        return str(path)
+    return None
+
+
+def _quit_gui(gui: str | None) -> None:
+    """End the window toolkit's event loop directly (pywebview cannot close a window that never appeared)."""
+    try:
+        if gui == "gtk":
+            from gi.repository import Gio, GLib  # type: ignore
+
+            def stop() -> bool:
+                app = getattr(sys.modules.get("webview.platforms.gtk"), "_app", None) or Gio.Application.get_default()
+                if app is not None:
+                    app.quit()
+                return False
+
+            GLib.idle_add(stop)
+        elif gui == "qt":
+            from qtpy.QtCore import QCoreApplication, QMetaObject, Qt  # type: ignore
+
+            app = QCoreApplication.instance()
+            if app is not None:
+                QMetaObject.invokeMethod(app, "quit", Qt.QueuedConnection)
+    except Exception as exc:
+        logging.getLogger("winrunner").debug("could not stop the window event loop: %s", exc)
+
+
 def _window_unavailable() -> str | None:
     """Why the native window cannot be used, or ``None`` when it can."""
+    if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return "there is no graphical desktop session (DISPLAY / WAYLAND_DISPLAY not set)"
     try:
         import webview  # type: ignore  # noqa: F401
     except ImportError:
-        return "pywebview is not installed"
+        return "pywebview is not installed (run setup.sh)"
     if sys.platform == "win32":
         from .platform import win32
 
         if not win32.webview2_version():
             return ("the Microsoft Edge WebView2 Runtime is not installed (needed for the app window; "
                     f"download: {WEBVIEW2_URL} or re-run install.bat)")
+    elif sys.platform.startswith("linux") and _linux_gui() is None:
+        return ("the app window needs WebKit2GTK for Python "
+                f"(sudo apt install {LINUX_WINDOW_PACKAGES}, or run setup.sh)")
     return None
 
 
@@ -103,7 +239,10 @@ def main(argv: list[str] | None = None) -> int:
     ui.add_argument("--headless", action="store_true", help="do not open the control panel")
     ap.add_argument("--model", help="model id to load at startup")
     ap.add_argument("--install-engine", choices=["vulkan", "rocm", "cpu"],
-                    help="download the latest llama.cpp release for this backend and exit")
+                    help="download a llama.cpp release for this backend and exit")
+    ap.add_argument("--engine-tag", help="with --install-engine: the llama.cpp release to install (e.g. b11269); "
+                                         "default: the latest release")
+    ap.add_argument("--check", action="store_true", help="print the engine and the GPUs it can use, then exit")
     ap.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
     ap.add_argument("--version", action="version", version=f"{PRODUCT_NAME} {__version__}")
     args = ap.parse_args(argv)
@@ -114,7 +253,9 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("winrunner")
 
     if args.install_engine:
-        return _install_engine(paths, args.install_engine)
+        return _install_engine(paths, args.install_engine, args.engine_tag)
+    if args.check:
+        return _check(paths)
 
     import uvicorn
 
@@ -155,8 +296,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             import webview  # type: ignore
 
-    # pythonw.exe has no console to close, so the control panel offers an Exit button.
-    ctx.extras["can_exit"] = open_mode == "window" or sys.stderr is None
+    # The control panel offers an Exit button whenever it is opened by WinRunner itself: an app window, or a
+    # browser tab (started from the desktop menu there is no terminal to press Ctrl+C in).
+    ctx.extras["can_exit"] = open_mode in ("window", "browser") or sys.stderr is None
     log.info("%s %s - API http://%s:%d/v1 - control panel %s", PRODUCT_NAME, __version__, host, port, ui_url)
 
     if open_mode == "window" and webview is not None:
@@ -188,30 +330,48 @@ def main(argv: list[str] | None = None) -> int:
 
         ctx.extras["toggle_fullscreen"] = toggle_fullscreen
         loaded = threading.Event()
+        gui_done = threading.Event()
         failed: list[str] = []
         window.events.loaded += lambda *a: loaded.set()
+        gui = "edgechromium" if sys.platform == "win32" else _linux_gui() if sys.platform.startswith("linux") else None
 
-        def watchdog() -> None:
-            # A broken browser engine leaves an empty window that never loads the page.
-            if not loaded.wait(WINDOW_LOAD_TIMEOUT) and not server.should_exit:
-                failed.append(f"the app window did not load within {WINDOW_LOAD_TIMEOUT:.0f} s")
+        def close_window() -> None:
+            # pywebview's destroy() waits until the window has been shown: never call it on a thread that must
+            # not block (the server's event loop, the watchdog).
+            def destroy() -> None:
                 try:
                     window.destroy()
                 except Exception:
                     pass
 
+            threading.Thread(target=destroy, name="window-close", daemon=True).start()
+            if not gui_done.wait(3.0):
+                _quit_gui(gui)
+
+        def watchdog() -> None:
+            # A broken browser engine leaves an empty window that never loads the page.
+            if not loaded.wait(WINDOW_LOAD_TIMEOUT) and not server.should_exit:
+                failed.append(f"the app window did not load within {WINDOW_LOAD_TIMEOUT:.0f} s")
+                close_window()
+
         def request_exit() -> None:
             server.should_exit = True
-            try:
-                window.destroy()
-            except Exception:
-                pass
+            threading.Thread(target=close_window, name="window-exit", daemon=True).start()
 
         ctx.extras["request_exit"] = request_exit
+        start_kw: dict = {"gui": gui, "private_mode": False}
+        icon = _window_icon(gui)
+        if icon:
+            start_kw["icon"] = icon
         try:
-            webview.start(watchdog, gui="edgechromium" if sys.platform == "win32" else None, private_mode=False)
+            try:
+                webview.start(watchdog, **start_kw)
+            except TypeError:  # older pywebview without the icon parameter
+                start_kw.pop("icon", None)
+                webview.start(watchdog, **start_kw)
         except Exception as exc:
             failed.append(f"the app window could not be created ({exc})")
+        gui_done.set()
         loaded.set()  # release the watchdog thread when the window closes early
         if failed and not server.should_exit:
             log.warning("%s; opening the control panel in the browser instead", failed[0])

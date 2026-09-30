@@ -7,20 +7,20 @@ network through an **OpenAI- and LM Studio-compatible API** at
 http://<this-computer>:5070/v1
 ```
 
-It drives the official [llama.cpp](https://github.com/ggml-org/llama.cpp) engine (`llama-server`), plans GPU
-memory for the context length you ask for, passes each model's own GGUF settings and chat template through
+It drives the official [llama.cpp](https://github.com/ggml-org/llama.cpp) engine (`llama-server`), fills your GPUs
+with the model for the context length you ask for, passes each model's own GGUF settings and chat template through
 unchanged, pairs vision projectors (mmproj) automatically, and ships a full control panel with live
 monitoring, laid out for portrait monitors.
 
-Target system this release is tuned for: **Windows 10 x64 · AMD Ryzen 5 3600 · 64 GB RAM · 2 × AMD Radeon RX 6800 (16 GB)**.
-Other Windows or Linux PCs with AMD, NVIDIA or Intel GPUs (or no GPU) work too.
+Target system this release is tuned for: **Linux Mint 22.2 x64 · AMD Ryzen 5 3600 · 64 GB RAM · 2 × AMD Radeon RX 6800 (16 GB)**.
+Other Ubuntu 24.04-based systems, other GPUs (or no GPU), and Windows 10/11 work too.
 
 ---
 
 ## Contents
 
 1. [Requirements](#requirements)
-2. [Installation (conda)](#installation-conda)
+2. [Installation on Linux Mint](#installation-on-linux-mint)
 3. [First start](#first-start)
 4. [Connecting clients](#connecting-clients)
 5. [API compatibility](#api-compatibility)
@@ -32,7 +32,8 @@ Other Windows or Linux PCs with AMD, NVIDIA or Intel GPUs (or no GPU) work too.
 11. [Command line](#command-line)
 12. [Files and folders](#files-and-folders)
 13. [Troubleshooting](#troubleshooting)
-14. [Development](#development)
+14. [Windows](#windows)
+15. [Development](#development)
 
 ---
 
@@ -40,58 +41,60 @@ Other Windows or Linux PCs with AMD, NVIDIA or Intel GPUs (or no GPU) work too.
 
 | Item | Version |
 |---|---|
-| **Python** | **3.11** (3.10–3.12 work; the conda environment uses 3.11) |
-| Conda | Miniconda, Miniforge or Anaconda |
-| OS | Windows 10/11 x64 (Linux x64 also supported) |
-| GPU driver | AMD Software: Adrenalin Edition (recent); it provides Vulkan and the ADL sensor library |
-| Browser engine for the app window | Microsoft Edge WebView2 Runtime (`install.bat` offers to install it; without it the control panel opens in the browser) |
+| OS | **Linux Mint 22.x** (or Ubuntu 24.04 "noble"), x86-64 |
+| **Python** | the system Python 3.12 (`/usr/bin/python3`); `setup.sh` creates a virtual environment in `.venv` |
+| GPU driver | the kernel's `amdgpu` driver and **Mesa RADV** (Vulkan), both part of Mint. No ROCm install is needed. |
+| llama.cpp | release **b11269** (official Ubuntu Vulkan build, downloaded by `setup.sh`) |
+| App window | WebKit2GTK 4.1 for Python (`gir1.2-webkit2-4.1`, installed by `setup.sh`); without it the panel opens in the browser |
 | Disk | ~300 MB for WinRunner + engine, plus your models |
 
 Python packages (`requirements.txt`): `fastapi`, `uvicorn[standard]`, `httpx`, `pydantic` 2, `psutil`, `pillow`,
-`jinja2`, and `pywebview` (Windows, for the native window). No compiler, CUDA/ROCm SDK or Node.js is needed.
+`jinja2` and `pywebview` (the app window). No compiler, CUDA/ROCm SDK or Node.js is needed.
 
-## Installation (conda)
+**About the llama.cpp version.** WinRunner pins llama.cpp **b11269** (it reports itself as `version 0.5.0-dev
+(build 11269)`, ggml 0.25.3). The memory planner was verified against this build's allocator and log output.
+llama.cpp publishes builds as `bNNNNN` tags; there is no llama.cpp or ggml release numbered "2.21.0". To install
+another build, run `./setup.sh --engine-tag bNNNNN` (or `LLAMA_CPP_TAG=bNNNNN ./setup.sh`). Builds already
+installed can be switched under **Settings › Engine**.
 
-### Automatic (Windows)
+## Installation on Linux Mint
 
-1. Install Miniconda if you do not have conda: <https://docs.conda.io/en/latest/miniconda.html>
-2. Download or clone this repository, e.g. to `C:\WinRunner`.
-3. Double-click **`install.bat`** (or run it from an Anaconda Prompt). It:
-   - creates the conda environment **`winrunner` with Python 3.11** from conda-forge (Anaconda's default
-     channels are not used, so no Terms-of-Service prompt / `CondaToSNonInteractiveError`),
-   - installs `requirements.txt`,
-   - downloads the latest official **llama.cpp Vulkan** build into `data\engines\`.
-
-   Use `install.bat rocm` to download the ROCm/HIP build instead (see [backends](#vulkan-or-rocm)).
-4. Optional, for access from other computers: right-click **`scripts\firewall.bat`** → *Run as administrator*
-   (opens TCP 5070 on private networks).
-5. Recommended for large models: right-click **`scripts\gpu-timeout.bat`** → *Run as administrator*, then restart
-   Windows. It raises the Windows GPU timeout from 2 to 60 seconds (see [GPU device lost](#gpu-device-lost)).
-
-### Manual
-
-```bat
-conda create -n winrunner --override-channels -c conda-forge python=3.11 pip -y
-conda activate winrunner
-cd C:\WinRunner
-pip install -r requirements.txt
-python -m winrunner --install-engine vulkan
+```bash
+git clone <this repository> ~/winrunner      # or unpack the download
+cd ~/winrunner
+./setup.sh
 ```
 
-or, equivalently, `conda env create -f environment.yml`.
+Run it as your normal user (not with `sudo`); it asks for your password when it installs packages. `setup.sh`:
+
+1. installs the system packages: Python venv, Mesa's Vulkan driver (RADV) and `vulkan-tools`, WebKit2GTK for
+   the app window, and the llama.cpp runtime libraries (`libgomp1`, `libssl3`);
+2. adds you to the `render` and `video` groups, which are needed for GPU compute (log out and back in once
+   afterwards if it says so);
+3. creates the Python environment in `.venv` (with the system's PyGObject, for the app window) and installs
+   `requirements.txt`;
+4. downloads the pinned **llama.cpp b11269 Vulkan** build into `data/engines/`;
+5. checks that the engine sees your GPUs (`vulkaninfo --summary` should list both RX 6800s with driver RADV);
+6. adds **WinRunner** to the application menu.
+
+Options: `--engine-tag bNNNNN` installs another llama.cpp build; `--cpu` installs the CPU-only build;
+`--no-apt` skips the system packages; `--firewall` also opens TCP 5070 in `ufw` for other computers.
+Running `setup.sh` again is safe: it updates what is there.
 
 ## First start
 
 | Launcher | What it does |
 |---|---|
-| **`WinRunner.bat`** | Starts WinRunner in its own application window (no console). |
-| `WinRunner-Console.bat` | Same, with a console showing the application log. Add `--headless` to run only the API server, `--browser` to use your web browser. |
+| **WinRunner** in the application menu | Starts WinRunner in its own application window. Console output goes to `data/logs/console.log`. |
+| `./run.sh` | Same, from a terminal (log in the terminal). |
+| `./run.sh --browser` | Control panel in your web browser. |
+| `./run.sh --headless` | API server only (automatic over SSH, when there is no desktop session). |
 
 On first start WinRunner scans these folders for `.gguf` files:
 
-- `<install folder>\models`
-- `%USERPROFILE%\.lmstudio\models` (LM Studio's folder: existing LM Studio downloads are reused as-is)
-- `%USERPROFILE%\.cache\lm-studio\models`
+- `<install folder>/models`
+- `~/.lmstudio/models` and `~/.cache/lm-studio/models` (LM Studio's folders: existing downloads are reused as-is)
+- `~/.cache/llama.cpp` (models downloaded by `llama-server -hf`)
 
 Add more under **Library › Folders**, or download models inside WinRunner (**Library › Download**, Hugging Face).
 
@@ -168,31 +171,43 @@ print(r.choices[0].message.content)
 
 ## GPU allocation and context length
 
-The default context is **65,536 tokens**. Before every load WinRunner plans memory for the chosen context:
+The default context is **65,536 tokens**. The context you set is the context the engine gets: WinRunner never
+shortens it to make a model fit. (A context above the model's *trained* length is clamped to the trained length
+unless you tick *Allow above trained context*, which uses RoPE scaling.)
 
-1. **Context.** The requested length is clamped to the model's trained context unless you tick
-   *Allow above trained context*, which uses RoPE scaling.
-2. **KV cache precision.** *Auto* keeps an **F16** cache. It switches to **Q8_0** (near-lossless, half the size)
-   only if that is what allows the entire model plus the full context to stay in VRAM. Q4 is never chosen
-   automatically.
-3. **Devices.** Free VRAM of each GPU is read from the engine itself (`llama-server --list-devices`), minus a
-   safety margin (1 GiB per GPU by default; adjustable, also per GPU).
-4. **Layer split.** Layers are assigned to GPUs in contiguous ranges sized by each layer's real cost:
-   weights + KV cache, with the output layer on the last GPU and the vision projector and compute buffers
-   accounted for. This mirrors llama.cpp's own assignment (`--tensor-split`).
-5. **If the model does not fit.**
-   - *Mixture-of-experts models:* all attention and KV stay on the GPUs and only the expert weights of the first
-     N layers move to system RAM (`--n-cpu-moe`). This is much faster than moving whole layers.
-   - *Dense models:* the minimum number of layers runs on the CPU.
-6. **Engine verification.** Builds that include `llama-fit-params` (all current releases) verify the plan with
-   llama.cpp's own allocator before loading. In automatic mode the engine's `--fit` then places layers within
-   your safety margins.
+In **Automatic** mode (default) WinRunner places the model **GPU first**:
+
+1. **Free memory per GPU** is read from the engine itself (`llama-server --list-devices`), after any previously
+   loaded model has actually released its memory. A **safety margin of 512 MiB per GPU** is kept free (adjustable,
+   also per GPU, in *Settings › Hardware*). A 16 GB RX 6800 therefore ends at about 15.5 GiB in use.
+2. **Everything on the GPUs if it fits.** Layers are split across the GPUs in contiguous ranges sized by each
+   layer's real cost (weights + KV cache), with the output layer on the last GPU and the compute buffers and vision
+   projector accounted for.
+3. **If it does not fit: attention first.** The attention weights and the **KV cache of every layer stay on the
+   GPUs**; only **feed-forward weights** (for mixture-of-experts models: expert weights) move to system RAM, one
+   matrix at a time, until each GPU is filled exactly to its margin (`--override-tensor ...=CPU`). Only if the
+   attention part of all layers cannot fit do the first layers run completely on the CPU.
+
+   Why this matters: llama.cpp's own fallback moves *whole layers* to the CPU, including their KV cache and the
+   attention over the whole context. The CPU then processes attention for every token of a long prompt, and the
+   scheduler copies data back and forth between the GPUs and the CPU. That was the cause of the extreme slowness.
+   Feed-forward weights in RAM cost far less: the CPU reads them once per generated token, and for long prompts
+   llama.cpp streams them to the first GPU in large batches.
+4. **KV cache precision.** *Auto* keeps an **F16** cache when model and context fit entirely in VRAM, otherwise it
+   uses **Q8_0** (near-lossless, half the size) so that more weights stay on the GPUs. Q4 is never chosen
+   automatically. The context length is not affected.
+5. **Measured by the engine.** Before each load the plan is checked with llama.cpp's own allocator: WinRunner
+   starts `llama-server` with the exact command line plus `--fit on`, reads its per-GPU memory projection and stops
+   it before it reads the weights (a few seconds). The plan is corrected until each GPU lands on its margin.
 
 The **Library › Load** tab shows all of this before you load: per-GPU stacked bars (weights, KV cache, compute
-buffers, vision projector, margin, free), a per-layer placement map, the largest context that still fits entirely
-in VRAM for F16 and Q8_0, and the exact `llama-server` command line.
+buffers, vision projector, margin, free), system RAM use, a per-layer placement map (a grey band marks layers whose
+feed-forward weights are in RAM), the largest context that still fits entirely in VRAM for F16 and Q8_0, and the
+exact `llama-server` command line.
 
-*Manual* mode lets you set GPU layers, tensor split, main GPU, split mode and MoE CPU layers yourself.
+*Manual* mode lets you set GPU layers, feed-forward / MoE layers on the CPU, tensor split, main GPU and split
+mode yourself. *Settings › Engine › Automatic placement* can hand placement to llama.cpp's own `--fit` instead
+(not recommended: it moves whole layers).
 
 ## GGUF settings and chat templates
 
@@ -241,30 +256,36 @@ What WinRunner does by default on this machine, and why:
 
 | Setting | Default | Reason |
 |---|---|---|
-| Backend | **Vulkan** | Needs only the Adrenalin driver; supports flash attention, quantized KV cache and multi-GPU on RDNA2 (gfx1030). |
-| Multi-GPU | **Layer split** across both RX 6800 | Only small activations cross PCIe between GPUs, so a secondary slot running at x4/x8 costs little. Row split needs fast inter-GPU links and is not recommended. |
-| Tensor split | Computed per model | Balances weights + KV per GPU. The display GPU usually has less free VRAM; the plan uses the measured free memory. |
+| Backend | **Vulkan (Mesa RADV)** | Part of Linux Mint; supports flash attention, quantized KV cache and multi-GPU on RDNA2 (gfx1030). WinRunner selects RADV even if AMD's AMDVLK driver is installed, and asks the driver to keep the model's buffers resident in VRAM (`GGML_VK_ENABLE_MEMORY_PRIORITY`). |
+| Multi-GPU | **Layer split** across both RX 6800 | Only small activations cross PCIe between GPUs, so a secondary slot running at x4 costs little. Row split needs fast inter-GPU links and is not recommended. |
+| VRAM use | Free VRAM − 512 MiB per GPU | Each GPU is filled to about 15.5 GiB. The GPU driving your display has less free VRAM; the plan uses the measured free memory of each GPU. |
+| Overflow | Feed-forward weights to RAM, attention + KV on the GPUs | See [GPU allocation](#gpu-allocation-and-context-length). |
 | Flash attention | Auto | Removes the huge attention scratch buffer at long context (tens of GiB at 64K without it). Required for a quantized V cache. |
-| KV cache | F16 → Q8_0 only if needed | Highest quality that still keeps the whole model in 32 GB of VRAM. |
-| Loading | Full read when fully offloaded, otherwise mmap | Faster, measurable loads straight into VRAM on Windows. mmap for partial offload avoids a second RAM copy. |
-| Threads | Engine default (6 = physical cores) | With full offload the CPU only schedules work, so SMT threads do not help. |
-| Process priority | Above normal | Keeps token generation smooth while you use the desktop. |
-| GPU timeout (TDR) | Windows: 2 s, raise with `scripts\gpu-timeout.bat` | Windows resets a GPU whose job runs longer than 2 s. That kills the engine's GPU context ("ErrorDeviceLost"). *Settings › Hardware* warns while the limit is at the default. |
+| KV cache | F16 → Q8_0 when the model does not fit | Highest quality that still keeps the most on the GPUs. |
+| Loading | Full read unless whole layers run on the CPU | Reads the file straight into VRAM / RAM once. |
+| Threads | Engine default (6 = physical cores) | The CPU computes the feed-forward weights kept in RAM; that is limited by memory bandwidth, so SMT threads do not help. |
 | Prompt cache | 8 GiB RAM | With 64 GB RAM, recent conversations resume instantly. |
 | Large MoE models | Experts in RAM | 64 GB RAM plus 32 GB VRAM run models like gpt-oss-120b / GLM-4.5-Air with attention on the GPUs. |
 
 Rough sizes for 2 × 16 GB, fully offloaded at 64K context: 7–14B models at Q8_0/Q6_K with an F16 KV cache;
-24–32B models at Q4_K_M with a Q8_0 KV cache. Use **Library › Load › Max full-offload ctx** to see the exact limit for each model.
+24–32B models at Q4_K_M with a Q8_0 KV cache. Use **Library › Load › Max full-offload ctx** to see the exact limit
+for each model. Larger models still keep attention on the GPUs and only overflow feed-forward weights.
+
+Hardware tips (*Settings › Hardware* checks these):
+
+- **Resizable BAR.** Enable *Above 4G decoding* and *Re-Size BAR* in the BIOS. Without it the CPU sees only a
+  256 MiB window of each GPU's memory.
+- **PCIe slots.** When weights are kept in RAM, llama.cpp streams them to the first GPU (`Vulkan0`) for long
+  prompts, so that GPU should be the one in the x16 slot. Mesa lists the GPU driving the display first.
+- A larger **micro-batch** (1024 or 2048, *Library › Load › Batching*) speeds up long prompts when weights are in
+  RAM, at the cost of some VRAM for compute buffers.
 
 ### Vulkan or ROCm?
 
-Both are official llama.cpp releases and can be installed side by side (**Settings › Engine**).
-
-- **Vulkan:** works with the graphics driver alone. Recommended default.
-- **ROCm / HIP** (`win-rocm` build): bundles the HIP runtime but loads rocBLAS from the **AMD HIP SDK for
-  Windows**, which must be installed. It can be faster at prompt processing.
-
-Compare both with your own models on the **Benchmark** tab (`llama-bench` with your exact load settings).
+llama.cpp publishes official Linux builds for Vulkan and CPU only. The Vulkan build with RADV is the recommended
+backend for the RX 6800 on Linux. A ROCm/HIP build of llama.cpp that you compiled yourself can be selected under
+**Settings › Engine › Custom engine**; compare both with your own models on the **Benchmark** tab (`llama-bench`
+with your exact load settings).
 
 ## The control panel
 
@@ -289,8 +310,9 @@ the right, and a status bar at the bottom.
   - board power and GFX/memory clocks;
   - fan speed.
 
-  Plus CPU per-thread load, RAM, engine process stats and a per-request speed history. Data sources are the Windows
-  GPU performance counters (the ones Task Manager uses) and the AMD driver's ADL sensors.
+  Plus CPU per-thread load, RAM, engine process stats and a per-request speed history. On Linux the data comes from the
+  amdgpu driver (`/sys/class/drm`: VRAM, utilisation, sensors) and each process's DRM memory statistics; on Windows
+  from the GPU performance counters and the AMD driver's ADL sensors.
 - **Benchmark.** `llama-bench` prompt processing / generation throughput with the model's load settings, with
   history.
 - **Logs.** Engine and application logs with level filters, search, follow mode and download.
@@ -312,29 +334,32 @@ the right, and a status bar at the bottom.
 **Keyboard.** **F2** hides or shows the title bar and the page tabs (remembered across restarts). **F11** switches
 the app window to full screen and back; in a web browser, F11 is the browser's own full screen.
 
-All settings persist in `data\settings.json`. Every setting has a tooltip.
+All settings persist in `data/settings.json`. Every setting has a tooltip.
 
 ## Command line
 
 ```
-python -m winrunner [--window | --browser | --headless] [--host 0.0.0.0] [--port 5070]
-                    [--model MODEL_ID] [--data-dir DIR] [--install-engine {vulkan,rocm,cpu}]
+./run.sh [--window | --browser | --headless] [--host 0.0.0.0] [--port 5070] [--model MODEL_ID] [--data-dir DIR]
+.venv/bin/python -m winrunner --install-engine {vulkan,cpu} [--engine-tag b11269]
+.venv/bin/python -m winrunner --check          # engine, driver and GPUs as the engine sees them
 ```
 
 ## Files and folders
 
 ```
-WinRunner\
-  winrunner\            application (Python package + control panel in winrunner\static)
-  data\                 created on first start
+winrunner/
+  setup.sh, run.sh      installer and launcher (Linux)
+  winrunner/            application (Python package + control panel in winrunner/static)
+  .venv/                Python environment created by setup.sh
+  data/                 created on first start
     settings.json       all settings (themes, defaults, per-model profiles)
-    engines\            downloaded llama.cpp builds (one folder per build/backend)
-    cache\              GGUF header index
-    chats\              saved chat console conversations
-    templates\          custom chat templates
-    logs\winrunner.log  application log (rotated)
+    engines/            downloaded llama.cpp builds (one folder per build/backend)
+    cache/              GGUF header index
+    chats/              saved chat console conversations
+    templates/          custom chat templates
+    logs/winrunner.log  application log (rotated); console.log when started from the menu
     benchmarks.json     benchmark history
-  models\               default download folder (publisher\repository\file.gguf)
+  models/               default download folder (publisher/repository/file.gguf)
 ```
 
 The whole folder is portable. Set `WINRUNNER_DATA` or `--data-dir` to keep data elsewhere.
@@ -343,60 +368,46 @@ The whole folder is portable. Set `WINRUNNER_DATA` or `--data-dir` to keep data 
 
 | Symptom | Fix |
 |---|---|
-| `CondaToSNonInteractiveError` during setup | Update to the current `install.bat` (it installs from conda-forge only). If you create the environment by hand, add `--override-channels -c conda-forge`. |
-| `WebView2 initialization failed` / `Couldn't find a compatible Webview2 Runtime` | The app window needs the [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (Evergreen Bootstrapper), or re-run `install.bat`. Until it is installed, WinRunner opens the control panel in your browser; use the power button in the header to exit. |
-| Other computers cannot connect | Run `scripts\firewall.bat` as administrator (or allow Python on *private* networks when Windows asks). Check that Settings › Network › Bind address is `0.0.0.0`. |
-| "No llama.cpp engine installed" | Settings › Engine › *Check for llama.cpp releases* › Install (Vulkan). |
-| Engine reports no GPUs | Update the Adrenalin driver; *Re-detect engine and devices*. For ROCm builds install the AMD HIP SDK. |
-| Load fails with out-of-memory | Lower the context, set KV cache to Q8_0, or raise the safety margin if other applications use VRAM. The memory plan shows the largest context that fits. |
+| `--check` / Settings › Hardware shows no GPU | Log out and back in after `setup.sh` (new `render`/`video` group membership). Check `vulkaninfo --summary`: it should list 2 × *AMD Radeon RX 6800 (RADV NAVI21)*. |
+| Only one GPU is used | Both must appear under *Settings › Hardware › Engine devices*. Check *Library › Load › Devices* (both ticked) and the per-GPU margins. |
+| GPUs are not filled to ~15.5 GiB | Other programs (browser, desktop) use VRAM on the display GPU; the plan uses what is actually free. The bars in *Library › Load* show "in use (other apps)". Lower the margin under *Settings › Hardware* if you want less headroom. |
+| App window does not open, panel opens in the browser | Install WebKit2GTK for Python: `sudo apt install python3-gi gir1.2-webkit2-4.1`, then run `./setup.sh` again. |
+| Other computers cannot connect | `./setup.sh --firewall` (or `sudo ufw allow 5070/tcp`). Check that Settings › Network › Bind address is `0.0.0.0`. |
+| "No llama.cpp engine installed" | `./setup.sh`, or Settings › Engine › *Check for llama.cpp releases* › Install (Vulkan). |
+| Load fails with out-of-memory | Raise the safety margin (*Settings › Hardware*) if other applications grab VRAM while the model loads. |
 | Port 5070 already in use | Close the other program (e.g. a second WinRunner) or change the port in Settings › Network (restart required). |
 | Model answers in a strange format | Keep *Template source: GGUF embedded*. Check the Chat Template tab; some old GGUFs have no template and need a built-in one. |
 | Images rejected | The model needs its mmproj file in the same folder (Vision tab). |
 | Control panel "not available on the network" | By default only this PC may open the panel; enable *Allow the control panel from other computers*. |
-| Requests fail with `vk::Queue::submit: ErrorDeviceLost`, or the engine exits with code 3221226505 (`0xC0000409`) | The GPU was reset while the engine was using it. WinRunner restarts the engine automatically. To prevent it, see [GPU device lost](#gpu-device-lost) below. |
+| Requests fail with `vk::Queue::submit: ErrorDeviceLost` | The GPU was reset. WinRunner restarts the engine automatically. On Linux check `sudo dmesg \| grep amdgpu` for ring timeouts, and remove GPU overclocks / undervolts. |
 
-Logs: **Logs** tab, or `data\logs\winrunner.log`.
+Logs: **Logs** tab, or `data/logs/winrunner.log`.
 
-### GPU device lost
+## Windows
 
-`decode() failed: vk::Queue::submit: ErrorDeviceLost` means the GPU was reset while llama.cpp was using it. The
-engine's GPU context is lost for good: the old engine process keeps running, but every later request fails. It
-often aborts on the next request (exit code 3221226505 = `0xC0000409`), even after sitting idle for hours.
-WinRunner detects both cases and restarts the engine automatically (see *Automatic recovery* under
-[API compatibility](#api-compatibility)). The activity log shows what happened.
-
-Common causes of the reset, most likely first:
-
-1. **Windows GPU timeout (TDR).** Windows resets a GPU when one GPU job runs longer than 2 seconds. Long prompts on
-   large models can exceed this, especially when part of the model runs from system RAM (MoE experts on the CPU,
-   partial offload, or VRAM spilling into shared GPU memory). Run `scripts\gpu-timeout.bat` as administrator and
-   restart Windows. It sets `TdrDelay` / `TdrDdiDelay` to 60 s; `scripts\gpu-timeout.bat reset` restores the
-   defaults. *Settings › Hardware* shows a note while the default applies.
-2. **VRAM shortage.** On Windows, when VRAM runs out, memory spills into shared system memory instead of failing.
-   Everything becomes very slow, which in turn triggers the timeout. Raise the safety margin (*Settings › Hardware*,
-   especially for the GPU driving your displays), lower the context length or use a Q8_0 KV cache. Very low prompt
-   speeds in the request history (tens of tokens/s where hundreds are normal) are a sign of spilling.
-3. **Driver or hardware instability.** Update the AMD Adrenalin driver. Remove overclocks or undervolts; they are
-   often stable in games but not under sustained compute. Check GPU temperatures on the **Monitor** tab.
+WinRunner still runs on Windows 10/11: double-click `install.bat` (conda environment, Vulkan engine), then start
+`WinRunner.bat`. `scripts\firewall.bat` opens the port, and `scripts\gpu-timeout.bat` raises the Windows GPU
+timeout (TDR) from 2 to 60 seconds, which long prompts on large models can otherwise exceed ("ErrorDeviceLost").
+The GPU-first allocation works the same way; Windows may limit each GPU to a little less than its full VRAM.
 
 ## Development
 
-```bat
+```bash
 pip install -r requirements-dev.txt
 python -m pytest
 ```
 
 The unit tests cover GGUF parsing, the memory planner, log parsing, command-line generation, image normalisation,
-the stream proxy and settings. `tests\test_recovery.py` checks engine failure recovery end to end: it runs the full
-server against a scripted fake `llama-server` (`tests\fake_engine.py`, Linux only) that loses its GPU, aborts or
+the stream proxy and settings. `tests/test_recovery.py` checks engine failure recovery end to end: it runs the full
+server against a scripted fake `llama-server` (`tests/fake_engine.py`, Linux only) that loses its GPU, aborts or
 crashes while idle.
 
-`tests\test_integration.py` runs the full server against a real engine. Set these first:
+`tests/test_integration.py` runs the full server against a real engine. Set these first:
 
 - `WINRUNNER_TEST_ENGINE`: path to `llama-server`
 - `WINRUNNER_TEST_MODELS`: a folder containing Qwen3-0.6B and SmolVLM-256M + mmproj GGUFs
 
-`tests\preview_server.py` starts the app with two simulated RX 6800s, for UI work on machines without those GPUs.
+`tests/preview_server.py` starts the app with two simulated RX 6800s, for UI work on machines without those GPUs.
 It is for development only; the product never reports simulated hardware.
 
 ## License

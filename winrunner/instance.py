@@ -16,7 +16,7 @@ import httpx
 import psutil
 
 from .cmdline import LaunchSpec
-from .engine import EngineInfo
+from .engine import EngineInfo, engine_env
 from .events import EventBus
 from .faults import describe_exit_code
 from .library import ModelEntry
@@ -143,7 +143,7 @@ class EngineInstance:
         self._log_line("info", "$ " + self.spec.display(), source="winrunner")
         kwargs: dict[str, Any] = dict(
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            cwd=os.path.dirname(self.engine.path) or None,
+            cwd=os.path.dirname(self.engine.path) or None, env=engine_env(),
         )
         if IS_WINDOWS:  # pragma: no cover
             from .platform.win32 import CREATE_NO_WINDOW, PRIORITY_FLAGS

@@ -136,7 +136,8 @@ export function mount(root) {
   function onSample(s, bulk = false) {
     const gl = s.gpus || [];
     if (!gl.length && !gpuHost.querySelector('.empty')) {
-      gpuHost.appendChild(group('GPU', empty('No GPU telemetry', 'No supported GPU counters were found. On Windows, GPU data comes from the performance counters (VRAM, utilisation) and the AMD driver (temperatures, clocks, power).'), { icon: 'chip' }));
+      gpuHost.appendChild(group('GPU', empty('No GPU telemetry', store.status?.platform === 'win32' ? 'No supported GPU counters were found. On Windows, GPU data comes from the performance counters (VRAM, utilisation) and the AMD driver (temperatures, clocks, power).'
+        : 'No supported GPU counters were found. On Linux, GPU data comes from the amdgpu driver in /sys/class/drm (VRAM, utilisation, temperatures, clocks, power) and nvidia-smi.'), { icon: 'chip' }));
     }
     for (const g of gl) pushGpu(s, gpuView(g), g);
     cpuChart.push(s.t, { u: s.cpu.util });

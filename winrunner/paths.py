@@ -62,4 +62,6 @@ def default_model_dirs() -> list[str]:
         home / ".lmstudio" / "models",
         home / ".cache" / "lm-studio" / "models",
     ]
+    if not IS_WINDOWS:
+        candidates.append(home / ".cache" / "llama.cpp")  # llama-server -hf downloads
     return [str(p) for p in candidates]

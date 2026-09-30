@@ -162,7 +162,7 @@ export function mount(root) {
     const planNotes = h('div');
     const bars = memBars();
     const lmap = layerMap();
-    const verifyBtn = btn('Verify with engine', () => runPlan(true), { icon: 'check', tip: 'Run llama-fit-params: the engine\'s own memory projection for these settings' });
+    const verifyBtn = btn('Verify with engine', () => runPlan(true), { icon: 'check', tip: 'Measure these settings with the engine: llama-server projects its memory use per GPU and stops before loading the weights' });
     planView = { planStatus, planStats, planNotes, bars, lmap, verifyBtn };
     planHost.append(planStatus, planStats, h('div', { class: 'divider' }), bars, h('div', { class: 'lm-title dim' }, 'Layer placement'), lmap, planNotes);
     cmdBox = h('pre', { class: 'code wrap', style: { maxHeight: '140px' } }, '');
@@ -234,19 +234,27 @@ export function mount(root) {
       if (r.devices?.length) devices = r.devices;
       clear(planStatus);
       const full = p.full_offload;
-      const cls = !r.devices?.length ? 'warn' : full ? 'ok' : 'warn';
-      const headline = !r.devices?.length ? 'CPU ONLY' : full ? 'FULL GPU OFFLOAD' : p.n_cpu_moe ? 'GPU + EXPERTS IN RAM' : 'PARTIAL OFFLOAD';
-      planStatus.append(h('span', { class: `led ${cls === 'ok' ? 'ok' : 'warn'}` }), h('b', { class: cls }, headline),
-        h('span', { class: 'dim' }, p.source === 'engine' ? 'verified by engine projection (llama-fit-params)' : p.use_engine_fit ? 'estimate · engine fits layers at load' : 'estimate'));
+      const cls = !r.devices?.length || p.strategy === 'cpu' ? 'warn' : full ? 'ok' : 'warn';
+      const ramWhat = p.devices.some((x) => x.ram_parts_mib > 0) && detail.info?.expert_count ? 'EXPERTS' : 'FFN';
+      const headline = !r.devices?.length || p.strategy === 'cpu' ? 'CPU ONLY' : full ? 'FULL GPU OFFLOAD'
+        : ({ attention_first: `GPU FIRST · ${ramWhat} OVERFLOW IN RAM`, layers: 'GPU FIRST · LEADING LAYERS ON CPU',
+          engine: 'PARTIAL OFFLOAD (LLAMA.CPP FIT)', manual: 'MANUAL · PARTIAL OFFLOAD' }[p.strategy] || 'PARTIAL OFFLOAD');
+      const source = p.source === 'engine' ? 'measured by the engine (llama-server projection)'
+        : p.use_engine_fit ? 'estimate · llama.cpp places the layers at load' : 'estimate · measured by the engine at load';
+      planStatus.append(h('span', { class: `led ${cls === 'ok' ? 'ok' : 'warn'}` }), h('b', { class: cls, 'data-tip': p.strategy_label || '' }, headline),
+        h('span', { class: 'dim' }, source));
       clear(planStats);
       const vramUsed = p.devices.reduce((a, x) => a + x.used_mib, 0);
       const vramFree = p.devices.reduce((a, x) => a + x.free_mib - x.margin_mib, 0);
+      const ramMib = p.totals.ram_parts_mib || 0;
       planStats.append(
-        stat('Context', fmt.num(p.ctx), p.ctx !== p.ctx_requested ? `Requested ${fmt.num(p.ctx_requested)}` : null),
+        stat('Context', fmt.num(p.ctx), p.ctx !== p.ctx_requested ? `Requested ${fmt.num(p.ctx_requested)}` : 'As set: the planner never shortens the context'),
         stat('KV cache', `${p.kv_k.toUpperCase()} · ${fmt.mib(p.totals.kv_mib)}`, `${fmt.bytes(p.kv_bytes_per_token)} per token`),
         stat('Flash attn', p.flash_attn),
-        stat('GPU layers', `${Math.min(p.gpu_layers, p.n_layer + 1)}/${p.n_layer + 1}`),
+        stat('GPU layers', `${Math.min(p.gpu_layers, p.n_layer + 1)}/${p.n_layer + 1}`,
+          p.cpu_layers ? `${p.cpu_layers} layers run entirely on the CPU` : 'Attention and KV cache of every layer are on the GPUs'),
         stat('VRAM', `${fmt.mib(vramUsed)} / ${fmt.mib(vramFree)}`, 'Planned use vs. free VRAM after safety margins'),
+        ramMib > 0 ? stat('Weights in RAM', `${fmt.mib(ramMib)}`, `${ramWhat === 'EXPERTS' ? 'Expert' : 'Feed-forward'} weights of ${p.ram_layers} layers (computed by the CPU)`) : null,
         stat('Max full-offload ctx', p.max_ctx_full_offload?.f16 !== undefined ? `${fmt.ctx(p.max_ctx_full_offload.f16)} F16 · ${fmt.ctx(p.max_ctx_full_offload.q8_0)} Q8_0` : '-',
           'Largest context that still fits entirely in VRAM with each KV cache type'),
         stat('Load mode', p.load_mode));
@@ -611,7 +619,7 @@ export function openDownloads(query = '') {
 // ------------------------------------------------------------------------------------
 export async function openFolders() {
   const list = h('div', { class: 'col' });
-  const path = input('', null, { placeholder: 'C:\\Models or D:\\LLM\\gguf', cls: 'grow mono' });
+  const path = input('', null, { placeholder: store.status?.platform === 'win32' ? 'C:\\Models or D:\\LLM\\gguf' : '/home/you/models or /mnt/data/gguf', cls: 'grow mono' });
   const body = h('div', { class: 'col' }, h('p', { class: 'dim' }, 'Folders are scanned recursively for .gguf files. LM Studio\'s model folder layout (publisher/repository/file.gguf) is supported.'),
     list, h('div', { class: 'row' }, path, btn('Add folder', async () => {
       try { await api.post(wr('/library/folder'), { path: path.value.trim(), action: 'add' }); path.value = ''; await render(); } catch (e) { toast(e.message, 'err'); }

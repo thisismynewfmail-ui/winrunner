@@ -44,8 +44,22 @@ def _ngl(engine: EngineInfo, n: int, n_layer: int) -> str:
     return str(n)
 
 
+def _split_str(split: list[float], sep: str) -> str:
+    return sep.join(str(int(x)) if float(x).is_integer() else f"{x:g}" for x in split)
+
+
+def _ffn_flag_or_overrides(engine: EngineInfo, flag: str, short: str, n: int, groups: tuple[str, ...]) -> list[str]:
+    """--n-cpu-moe / --n-cpu-ffn N, or the equivalent --override-tensor entry on builds without the flag."""
+    if engine.has(flag, short):
+        return [flag, str(n)]
+    if engine.has("--override-tensor", "-ot"):
+        layers = "|".join(str(i) for i in range(n))
+        return ["-ot", f"blk\\.({layers})\\.({'|'.join(groups)})\\.=CPU"]
+    return []
+
+
 def gpu_args(engine: EngineInfo, p: LoadParams, plan: Plan, device_names: list[str]) -> list[str]:
-    """Device placement arguments (shared by server, fit-params and bench)."""
+    """Device placement arguments (shared by the server and llama-fit-params)."""
     a: list[str] = []
     if p.devices and engine.has("--device", "-dev"):
         a += ["--device", ",".join(p.devices)]
@@ -56,33 +70,38 @@ def gpu_args(engine: EngineInfo, p: LoadParams, plan: Plan, device_names: list[s
     if plan.split_mode in ("none", "row") and engine.has("--main-gpu", "-mg"):
         a += ["-mg", str(p.main_gpu)]
     if plan.use_engine_fit and engine.has("--fit", "-fit"):
-        return a  # the engine decides layers / split / expert placement within the given margins
+        return a  # llama.cpp's --fit places the layers itself (placement "engine")
     a += ["-ngl", _ngl(engine, plan.gpu_layers, plan.n_layer)]
     if plan.tensor_split and len(device_names) > 1 and engine.has("--tensor-split", "-ts"):
-        a += ["-ts", ",".join(str(int(x)) if float(x).is_integer() else f"{x:g}" for x in plan.tensor_split)]
+        a += ["-ts", _split_str(plan.tensor_split, ",")]
+    if plan.overrides and engine.has("--override-tensor", "-ot"):
+        a += ["-ot", ",".join(plan.overrides)]
     if plan.n_cpu_moe > 0:
-        if engine.has("--n-cpu-moe", "-ncmoe"):
-            a += ["--n-cpu-moe", str(plan.n_cpu_moe)]
-        elif engine.has("--override-tensor", "-ot"):
-            pat = ",".join(f"blk\\.{i}\\.ffn_(up|down|gate)_exps=CPU" for i in range(plan.n_cpu_moe))
-            a += ["-ot", pat]
+        a += _ffn_flag_or_overrides(engine, "--n-cpu-moe", "-ncmoe", plan.n_cpu_moe,
+                                    ("ffn_up_exps", "ffn_down_exps", "ffn_gate_exps", "ffn_gate_up_exps"))
+    if plan.n_cpu_ffn > 0:
+        a += _ffn_flag_or_overrides(engine, "--n-cpu-ffn", "-ncffn", plan.n_cpu_ffn, ("ffn_up", "ffn_down", "ffn_gate"))
     return a
 
 
 def fit_args(engine: EngineInfo, plan: Plan, margins: list[int]) -> list[str]:
+    """llama.cpp's --fit: places the layers for placement "engine"; otherwise it only checks the projected memory.
+
+    With an explicit -ngl the engine never changes the placement: it measures the vision projector, compares
+    the projection with the free memory targets and logs the result.
+    """
     a: list[str] = []
     if not engine.has("--fit", "-fit"):
         return a
-    if plan.use_engine_fit:
-        a += ["--fit", "on"]
-        if margins and engine.has("--fit-target", "-fitt"):
-            a += ["--fit-target", ",".join(str(int(m)) for m in margins)]
-    else:
-        a += ["--fit", "off"]
+    if plan.mode == "manual":
+        return ["--fit", "off"]
+    a += ["--fit", "on"]
+    if margins and engine.has("--fit-target", "-fitt"):
+        a += ["--fit-target", ",".join(str(int(m)) for m in margins)]
     return a
 
 
-def context_args(engine: EngineInfo, p: LoadParams, plan: Plan) -> list[str]:
+def context_args(engine: EngineInfo, p: LoadParams, plan: Plan, for_fit: bool = False) -> list[str]:
     a = ["-c", str(plan.ctx)]
     if p.batch_size != 2048:
         a += ["-b", str(p.batch_size)]
@@ -101,7 +120,9 @@ def context_args(engine: EngineInfo, p: LoadParams, plan: Plan) -> list[str]:
         a += ["-nkvo"]
     if p.swa_full and engine.has("--swa-full"):
         a += ["--swa-full"]
-    if plan.parallel and plan.parallel > 0:
+    # llama-fit-params keeps its default single sequence: the server's slots share one unified KV cache of the
+    # same size (--kv-unified), which that measures most closely
+    if plan.parallel and plan.parallel > 0 and not for_fit:
         a += ["-np", str(plan.parallel)]
     if p.threads > 0:
         a += ["-t", str(p.threads)]
@@ -230,19 +251,22 @@ def build_server_args(
 
 def build_fit_args(engine: EngineInfo, model_path: str, p: LoadParams, plan: Plan, device_names: list[str],
                    margins: list[int], print_mode: bool) -> list[str] | None:
-    """Arguments for llama-fit-params (engine-side memory projection)."""
+    """Arguments for llama-fit-params.
+
+    ``print_mode``: measure the plan's own placement (--fit-print: model / context / compute MiB per device).
+    Otherwise: let llama.cpp fit layers within ``margins`` and print the resulting arguments.
+    """
     if not engine.fit_params:
         return None
     a = [engine.fit_params, "-m", model_path]
-    a += [x for x in context_args(engine, p, plan)]
-    if plan.use_engine_fit and not print_mode:
-        a += gpu_args(engine, p, plan, device_names)
+    a += context_args(engine, p, plan, for_fit=True)
+    if print_mode:
+        a += gpu_args(engine, p, _explicit(plan), device_names)
+        a += ["--fit-print", "on"]
+    else:
+        a += gpu_args(engine, p, _engine_placed(plan), device_names)
         if engine.has("--fit-target", "-fitt") and margins:
             a += ["--fit-target", ",".join(str(int(m)) for m in margins)]
-    else:
-        a += gpu_args(engine, p, _explicit(plan), device_names)
-    if print_mode:
-        a += ["--fit-print", "on"]
     return a
 
 
@@ -254,8 +278,17 @@ def _explicit(plan: Plan) -> Plan:
     return q
 
 
+def _engine_placed(plan: Plan) -> Plan:
+    import copy
+
+    q = copy.copy(plan)
+    q.use_engine_fit = True
+    return q
+
+
 def build_bench_args(engine: EngineInfo, model_path: str, p: LoadParams, plan: Plan, device_names: list[str],
-                     n_prompt: str, n_gen: str, depth: str, reps: int) -> list[str] | None:
+                     n_prompt: str, n_gen: str, depth: str, reps: int, threads: int = 0) -> list[str] | None:
+    """llama-bench with the plan's placement (same layers, split and weights in RAM as the server)."""
     if not engine.bench:
         return None
     q = _explicit(plan)
@@ -273,13 +306,21 @@ def build_bench_args(engine: EngineInfo, model_path: str, p: LoadParams, plan: P
         if q.split_mode != "layer":
             a += ["-sm", q.split_mode]
         if q.tensor_split and len(device_names) > 1:
-            a += ["-ts", "/".join(str(int(x)) if float(x).is_integer() else f"{x:g}" for x in q.tensor_split)]
+            a += ["-ts", _split_str(q.tensor_split, "/")]
+        if q.overrides:
+            a += ["-ot", ";".join(q.overrides)]  # llama-bench: ';' within one configuration
         if q.n_cpu_moe > 0:
             a += ["-ncmoe", str(q.n_cpu_moe)]
+        if q.n_cpu_ffn > 0:
+            layers = "|".join(str(i) for i in range(q.n_cpu_ffn))
+            a += ["-ot", f"blk\\.({layers})\\.(ffn_up|ffn_down|ffn_gate)\\.=CPU"]
         if p.devices:
             a += ["-dev", "/".join(p.devices)]
     else:
         a += ["-ngl", "0"]
-    if p.threads > 0:
-        a += ["-t", str(p.threads)]
+    if q.load_mode and q.load_mode != "auto":
+        a += ["-lm", q.load_mode]
+    t = p.threads if p.threads > 0 else threads
+    if t > 0:
+        a += ["-t", str(t)]  # llama-bench defaults to 4 threads, the server to one per physical core
     return a
