@@ -25,7 +25,7 @@ from .util import slugify
 
 log = logging.getLogger("winrunner.library")
 
-INDEX_VERSION = 3
+INDEX_VERSION = 4  # 4: ModelInfo.layer_parts
 _MMPROJ_NAME_RE = re.compile(r"mmproj|vision[-_]?proj|clip[-_]", re.IGNORECASE)
 _PRECISION_RANK = ["f16", "bf16", "f32", "q8_0", "q6_k", "q5_k", "q4_k", "q4_0"]
 

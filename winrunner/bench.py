@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .engine import engine_env
 from .paths import IS_WINDOWS
 from .util import new_id, strip_ansi
 
@@ -60,7 +61,7 @@ class BenchRunner:
         def work() -> tuple[int, str]:
             self._proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                           stdin=subprocess.DEVNULL, cwd=os.path.dirname(args[0]) or None,
-                                          creationflags=_CREATE_NO_WINDOW)
+                                          env=engine_env(), creationflags=_CREATE_NO_WINDOW)
             out_chunks: list[bytes] = []
 
             def pump_err() -> None:

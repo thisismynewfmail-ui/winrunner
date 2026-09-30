@@ -59,12 +59,18 @@ class EngineSettings(_Model):
     active_engine: str = ""  # name of the managed engine directory in use
     process_priority: Literal["normal", "above_normal", "high"] = "above_normal"
     log_verbosity: int = 4
+    # Automatic GPU allocation:
+    #   "gpu_first" - WinRunner fills every GPU to its free memory minus the margin, keeping attention and the
+    #                 KV cache of all layers on the GPUs and moving only feed-forward weights to system RAM
+    #   "engine"    - llama.cpp's own --fit decides at load time (moves whole layers to the CPU)
+    placement: Literal["gpu_first", "engine"] = "gpu_first"
+    # Measure plans with the engine's allocator (llama-fit-params) before loading
     use_engine_fit: bool = True
     load_timeout_s: int = 900
 
 
 class HardwareSettings(_Model):
-    vram_margin_mib: int = 1024
+    vram_margin_mib: int = 512  # left free on every GPU after the model is loaded
     vram_margin_per_device: dict[str, int] = Field(default_factory=dict)
     telemetry_interval_s: float = 1.0
 
@@ -76,7 +82,8 @@ class LoadParams(_Model):
     allow_context_over_train: bool = False
     gpu_offload: Literal["auto", "manual"] = "auto"
     n_gpu_layers: int = -1  # manual mode: -1 = all layers
-    n_cpu_moe: int = 0  # manual mode
+    n_cpu_moe: int = 0  # manual mode: expert weights of the first N layers in system RAM
+    n_cpu_ffn: int = 0  # manual mode: dense feed-forward weights of the first N layers in system RAM
     devices: list[str] = Field(default_factory=list)  # empty = all GPUs
     split_mode: Literal["layer", "row", "none", "tensor"] = "layer"
     tensor_split: list[float] = Field(default_factory=list)  # empty = automatic
@@ -189,8 +196,11 @@ class StartupSettings(_Model):
     last_model: str = ""
 
 
+SETTINGS_VERSION = 2
+
+
 class Settings(_Model):
-    version: int = 1
+    version: int = SETTINGS_VERSION
     server: ServerSettings = Field(default_factory=ServerSettings)
     engine: EngineSettings = Field(default_factory=EngineSettings)
     hardware: HardwareSettings = Field(default_factory=HardwareSettings)
@@ -239,6 +249,21 @@ def _atomic_write_json(path: Path, data: Any) -> None:
             time.sleep(0.05 * (attempt + 1))
 
 
+def migrate(raw: dict) -> bool:
+    """Upgrade settings written by older versions in place. Returns True when something changed."""
+    if not isinstance(raw, dict):
+        return False
+    version = raw.get("version", 1)
+    if not isinstance(version, int) or version >= SETTINGS_VERSION:
+        return False
+    hw = raw.get("hardware")
+    if isinstance(hw, dict) and hw.get("vram_margin_mib") == 1024:
+        # 1.x kept 1 GiB free on every GPU; the GPU-first placement leaves 512 MiB
+        hw["vram_margin_mib"] = 512
+    raw["version"] = SETTINGS_VERSION
+    return True
+
+
 class SettingsStore:
     """Thread-safe owner of the persisted :class:`Settings`."""
 
@@ -255,7 +280,11 @@ class SettingsStore:
             return s
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            return Settings.model_validate(raw)
+            migrated = migrate(raw)
+            s = Settings.model_validate(raw)
+            if migrated:
+                _atomic_write_json(self.path, s.model_dump(mode="json"))
+            return s
         except Exception as exc:  # corrupt or invalid file: keep a backup, start clean
             backup = self.path.with_suffix(f".invalid-{int(time.time())}.json")
             try:

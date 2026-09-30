@@ -56,6 +56,21 @@ def _plat_key() -> str:
     return "win" if IS_WINDOWS else "linux"
 
 
+def engine_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for llama.cpp processes."""
+    env = dict(os.environ)
+    if not IS_WINDOWS:
+        # Vulkan on Linux (RADV): give llama.cpp's buffers the highest residency priority, so that when the
+        # desktop or a browser needs VRAM the driver moves their memory to system RAM, not the model weights
+        # (weights in system RAM would be read over PCIe for every token).
+        env.setdefault("GGML_VK_ENABLE_MEMORY_PRIORITY", "1")
+        # AMD's own Vulkan driver (AMDVLK), if installed, hands over to Mesa's RADV: faster for llama.cpp
+        env.setdefault("AMD_VULKAN_ICD", "RADV")
+    if extra:
+        env.update(extra)
+    return env
+
+
 def _run(args: list[str], timeout: float = 30.0, cwd: str | None = None) -> tuple[int, str]:
     try:
         r = subprocess.run(
@@ -65,6 +80,7 @@ def _run(args: list[str], timeout: float = 30.0, cwd: str | None = None) -> tupl
             stdin=subprocess.DEVNULL,
             timeout=timeout,
             cwd=cwd,
+            env=engine_env(),
             creationflags=_CREATE_NO_WINDOW,
         )
         return r.returncode, strip_ansi(r.stdout.decode("utf-8", errors="replace"))
