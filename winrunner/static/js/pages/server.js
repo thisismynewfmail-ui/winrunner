@@ -75,10 +75,10 @@ export function mount(root) {
         instCards.set(inst.id, c);
         instBody.appendChild(c.el);
       }
-      const led = inst.state === 'ready' ? 'ok' : inst.state === 'error' ? 'err' : 'acc blink';
+      const led = inst.state === 'ready' ? 'ok' : inst.recovering ? 'warn blink' : inst.state === 'error' ? 'err' : 'acc blink';
       clear(c.head);
       c.head.append(h('span', { class: `led big ${led}` }), h('b', null, inst.model),
-        h('span', { class: 'chip' }, inst.state === 'loading' ? `${inst.phase_label} ${Math.round(inst.progress * 100)}%` : inst.state),
+        h('span', { class: 'chip' }, inst.state === 'loading' ? `${inst.phase_label} ${Math.round(inst.progress * 100)}%` : inst.recovering ? 'restarting' : inst.state),
         inst.vision ? h('span', { class: 'badge vision' }, icon('eye'), 'vision') : null,
         h('span', { class: 'dim' }, `llama.cpp b${inst.engine?.build} ${inst.engine?.backend} · pid ${inst.pid ?? '-'}`),
         h('span', { class: 'spacer' }),

@@ -26,6 +26,7 @@ export function engineState() {
   const ready = insts.find((i) => i.state === 'ready');
   if (ready) return { key: 'ready', label: 'READY', led: 'ok', detail: ready.model, inst: ready };
   const err = insts.find((i) => i.state === 'error');
+  if (err?.recovering) return { key: 'loading', label: 'RESTARTING', led: 'warn blink', detail: `${err.model} · ${err.error}`, inst: err };
   if (err) return { key: 'error', label: 'ERROR', led: 'err', detail: err.error || err.model, inst: err };
   return { key: 'idle', label: 'IDLE', led: '', detail: 'No model loaded' };
 }

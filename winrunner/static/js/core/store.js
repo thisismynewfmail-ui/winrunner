@@ -146,6 +146,9 @@ class Store extends Emitter {
       case 'request': {
         const r = ev.record;
         const isNew = !this.requests.has(r.id);
+        // re-run after an engine failure: the partial output shown so far is discarded
+        const rerun = !isNew && (r.retries || 0) > (this.requests.get(r.id).retries || 0);
+        if (rerun && this.tokenBuf.has(r.id)) this.tokenBuf.set(r.id, []);
         this.requests.set(r.id, r);
         if (isNew) {
           this.focusRid = r.id;
@@ -154,7 +157,7 @@ class Store extends Emitter {
           if (this.requests.size > REQ_MAX) this.requests.delete(this.requests.keys().next().value);
         }
         if (r.t_end && r.gen_tps) this.tps.push({ t: r.t_end, tg: r.gen_tps, pp: r.prompt_tps, n: r.tokens, id: r.id });
-        this.emit('request', { rec: r, isNew });
+        this.emit('request', { rec: r, isNew, rerun });
         break;
       }
       case 'tokens': {

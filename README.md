@@ -65,6 +65,8 @@ Python packages (`requirements.txt`): `fastapi`, `uvicorn[standard]`, `httpx`, `
    Use `install.bat rocm` to download the ROCm/HIP build instead (see [backends](#vulkan-or-rocm)).
 4. Optional, for access from other computers: right-click **`scripts\firewall.bat`** → *Run as administrator*
    (opens TCP 5070 on private networks).
+5. Recommended for large models: right-click **`scripts\gpu-timeout.bat`** → *Run as administrator*, then restart
+   Windows. It raises the Windows GPU timeout from 2 to 60 seconds (see [GPU device lost](#gpu-device-lost)).
 
 ### Manual
 
@@ -108,8 +110,15 @@ http://127.0.0.1:5070/v1          (on this PC)
 - **API key:** not required by default. Any string works as the key in clients that insist on one. You can require a
   key under **Settings › Network**.
 - **Model name:** use the model id shown in the Library (e.g. `qwen3-32b-q4_k_m`). Aliases, file names, LM Studio
-  style `publisher/repo` names and unique prefixes are also accepted. If a client sends an unknown name
-  (e.g. `gpt-4o`), the currently loaded model answers.
+  style `publisher/repo` names and unique prefixes are also accepted. Requests never fail because of the model
+  name:
+  - A name that is not in the library (e.g. `gpt-4o`, or a client's fixed default) is answered by the currently
+    loaded model.
+  - If no model is loaded, the model used last is loaded first (just-in-time loading).
+  - With just-in-time loading off, the loaded model also answers requests that name a different library model,
+    instead of switching models.
+
+  The activity log notes each substituted name once, and responses carry the id of the model that answered.
 
 Works with Open WebUI, SillyTavern, Continue, Cline, AnythingLLM, Msty, Chatbox, the OpenAI Python/JS SDKs,
 the LM Studio SDK and anything else that speaks the OpenAI API.
@@ -148,6 +157,14 @@ print(r.choices[0].message.content)
 - *Live telemetry for every client.* Non-streaming chat requests are streamed internally so the control panel can
   show prompt progress and tokens live. The response returned to the client is the normal non-streaming JSON, the
   same shape the engine produces.
+- *Automatic recovery.* If the engine crashes, or reports that it lost its GPU (`ErrorDeviceLost`), WinRunner takes
+  it out of service at once and starts a new engine process with the same settings. It waits until the GPUs are usable
+  again after a reset, and tries up to three times if the reload fails. Requests that arrive in the meantime wait
+  for the new engine. A request that was interrupted before any output reached the client (non-streaming requests,
+  and streaming requests before the first token) is run again automatically, once. Streaming clients that already
+  received part of the answer get an error event and can retry. If a model fails again after 3 automatic restarts
+  within 10 minutes, WinRunner unloads it instead. It is loaded again from the Library, or by the next request
+  that names it when just-in-time loading is on.
 
 ## GPU allocation and context length
 
@@ -232,6 +249,7 @@ What WinRunner does by default on this machine, and why:
 | Loading | Full read when fully offloaded, otherwise mmap | Faster, measurable loads straight into VRAM on Windows. mmap for partial offload avoids a second RAM copy. |
 | Threads | Engine default (6 = physical cores) | With full offload the CPU only schedules work, so SMT threads do not help. |
 | Process priority | Above normal | Keeps token generation smooth while you use the desktop. |
+| GPU timeout (TDR) | Windows: 2 s, raise with `scripts\gpu-timeout.bat` | Windows resets a GPU whose job runs longer than 2 s. That kills the engine's GPU context ("ErrorDeviceLost"). *Settings › Hardware* warns while the limit is at the default. |
 | Prompt cache | 8 GiB RAM | With 64 GB RAM, recent conversations resume instantly. |
 | Large MoE models | Experts in RAM | 64 GB RAM plus 32 GB VRAM run models like gpt-oss-120b / GLM-4.5-Air with attention on the GPUs. |
 
@@ -291,6 +309,9 @@ the right, and a status bar at the bottom.
 - the live **token stream** of the current request, with token boundaries and reasoning shown dimmed;
 - the event log.
 
+**Keyboard.** **F2** hides or shows the title bar and the page tabs (remembered across restarts). **F11** switches
+the app window to full screen and back; in a web browser, F11 is the browser's own full screen.
+
 All settings persist in `data\settings.json`. Every setting has a tooltip.
 
 ## Command line
@@ -332,8 +353,31 @@ The whole folder is portable. Set `WINRUNNER_DATA` or `--data-dir` to keep data 
 | Model answers in a strange format | Keep *Template source: GGUF embedded*. Check the Chat Template tab; some old GGUFs have no template and need a built-in one. |
 | Images rejected | The model needs its mmproj file in the same folder (Vision tab). |
 | Control panel "not available on the network" | By default only this PC may open the panel; enable *Allow the control panel from other computers*. |
+| Requests fail with `vk::Queue::submit: ErrorDeviceLost`, or the engine exits with code 3221226505 (`0xC0000409`) | The GPU was reset while the engine was using it. WinRunner restarts the engine automatically. To prevent it, see [GPU device lost](#gpu-device-lost) below. |
 
 Logs: **Logs** tab, or `data\logs\winrunner.log`.
+
+### GPU device lost
+
+`decode() failed: vk::Queue::submit: ErrorDeviceLost` means the GPU was reset while llama.cpp was using it. The
+engine's GPU context is lost for good: the old engine process keeps running, but every later request fails. It
+often aborts on the next request (exit code 3221226505 = `0xC0000409`), even after sitting idle for hours.
+WinRunner detects both cases and restarts the engine automatically (see *Automatic recovery* under
+[API compatibility](#api-compatibility)). The activity log shows what happened.
+
+Common causes of the reset, most likely first:
+
+1. **Windows GPU timeout (TDR).** Windows resets a GPU when one GPU job runs longer than 2 seconds. Long prompts on
+   large models can exceed this, especially when part of the model runs from system RAM (MoE experts on the CPU,
+   partial offload, or VRAM spilling into shared GPU memory). Run `scripts\gpu-timeout.bat` as administrator and
+   restart Windows. It sets `TdrDelay` / `TdrDdiDelay` to 60 s; `scripts\gpu-timeout.bat reset` restores the
+   defaults. *Settings › Hardware* shows a note while the default applies.
+2. **VRAM shortage.** On Windows, when VRAM runs out, memory spills into shared system memory instead of failing.
+   Everything becomes very slow, which in turn triggers the timeout. Raise the safety margin (*Settings › Hardware*,
+   especially for the GPU driving your displays), lower the context length or use a Q8_0 KV cache. Very low prompt
+   speeds in the request history (tens of tokens/s where hundreds are normal) are a sign of spilling.
+3. **Driver or hardware instability.** Update the AMD Adrenalin driver. Remove overclocks or undervolts; they are
+   often stable in games but not under sustained compute. Check GPU temperatures on the **Monitor** tab.
 
 ## Development
 
@@ -343,7 +387,9 @@ python -m pytest
 ```
 
 The unit tests cover GGUF parsing, the memory planner, log parsing, command-line generation, image normalisation,
-the stream proxy and settings.
+the stream proxy and settings. `tests\test_recovery.py` checks engine failure recovery end to end: it runs the full
+server against a scripted fake `llama-server` (`tests\fake_engine.py`, Linux only) that loses its GPU, aborts or
+crashes while idle.
 
 `tests\test_integration.py` runs the full server against a real engine. Set these first:
 

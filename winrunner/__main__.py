@@ -178,6 +178,15 @@ def main(argv: list[str] | None = None) -> int:
             pass
         window = webview.create_window(f"{PRODUCT_NAME} {__version__}", ui_url, width=width, height=height,
                                        min_size=(760, 640), background_color="#1f241b", text_select=True)
+        fullscreen = [False]
+
+        def toggle_fullscreen() -> bool:
+            """F11 in the control panel (the app window has no browser full-screen mode of its own)."""
+            window.toggle_fullscreen()
+            fullscreen[0] = not fullscreen[0]
+            return fullscreen[0]
+
+        ctx.extras["toggle_fullscreen"] = toggle_fullscreen
         loaded = threading.Event()
         failed: list[str] = []
         window.events.loaded += lambda *a: loaded.set()
@@ -207,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         if failed and not server.should_exit:
             log.warning("%s; opening the control panel in the browser instead", failed[0])
             ctx.extras.update(window_mode=False, can_exit=True, request_exit=lambda: setattr(server, "should_exit", True),
+                              toggle_fullscreen=None,
                               notice=f"The app window failed: {failed[0]}. Using the browser instead.")
             webbrowser.open(ui_url)
             while t.is_alive():  # keep serving until Exit is pressed in the control panel

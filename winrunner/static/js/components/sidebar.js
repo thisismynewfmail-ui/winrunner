@@ -108,7 +108,7 @@ export function mountSidebar(root) {
       eProg.firstChild.style.width = `${(inst.progress || 0) * 100}%`;
       setText(eProgLbl, `${inst.phase_label || inst.phase} · ${Math.round((inst.progress || 0) * 100)}%`);
     }
-    setText(eUp, inst.state === 'ready' && inst.t_ready ? fmt.uptime(store.now() - inst.t_ready) : inst.state);
+    setText(eUp, inst.state === 'ready' && inst.t_ready ? fmt.uptime(store.now() - inst.t_ready) : inst.recovering ? 'restarting' : inst.state);
     lmap.update(p, { progress: inst.progress, loading, loadInfo: loading ? null : li });
   }
 
@@ -271,8 +271,8 @@ export function mountSidebar(root) {
   store.on('activity', (ev) => addEvent(ev));
   store.on('metrics', (s) => { renderGpus(s); pushTps(); renderEngine(); });
   for (const e of ['instance', 'instance_progress', 'instance_removed', 'status', 'ws']) store.on(e, renderEngine);
-  store.on('request', ({ rec, isNew }) => {
-    if (isNew) resetTokens(rec.id);
+  store.on('request', ({ rec, isNew, rerun }) => {
+    if (isNew || (rerun && rec.id === shownRid)) resetTokens(rec.id);
     if (rec.id === shownRid) renderTokInfo();
     renderPipeline();
     renderThroughput();
