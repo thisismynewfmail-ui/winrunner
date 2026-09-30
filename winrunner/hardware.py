@@ -22,6 +22,7 @@ import psutil
 log = logging.getLogger("winrunner.hardware")
 
 IS_WINDOWS = sys.platform == "win32"
+MiB = 1024 * 1024
 
 if IS_WINDOWS:  # pragma: no cover - exercised on Windows only
     from .platform import win32 as _plat
@@ -48,6 +49,14 @@ class GpuInfo:
 
 
 _VENDORS = {0x1002: "AMD", 0x10DE: "NVIDIA", 0x8086: "Intel", 0x1414: "Microsoft"}
+
+
+def _pci_bus(pci: Any) -> int | None:
+    """Bus number of a PCI address such as '0000:0b:00.0'."""
+    try:
+        return int(str(pci).split(":")[-2], 16)
+    except (ValueError, IndexError):
+        return None
 
 
 def _norm_name(s: str) -> str:
@@ -198,6 +207,10 @@ class HardwareMonitor:
         enumerate in PCI order, matching our bus sort).
         """
         mapping: dict[str, str] = {}
+        by_bus = {g.bus: g for g in self.gpus if g.bus is not None}
+        if devices and all(_pci_bus(d.get("pci")) in by_bus for d in devices):
+            # the engine logged each device's PCI address: exact, whatever the enumeration order
+            return {d["name"]: by_bus[_pci_bus(d.get("pci"))].id for d in devices}
         cards = [g for g in self.gpus if g.sysfs]
         if not IS_WINDOWS and cards and len(cards) == len(self.gpus):
             used = {}
@@ -225,7 +238,49 @@ class HardwareMonitor:
             if best is not None:
                 mapping[d["name"]] = best.id
                 pool.remove(best)
+        if IS_WINDOWS:
+            self._rank_identical(devices, mapping)
         return mapping
+
+    def _rank_identical(self, devices: list[dict[str, Any]], mapping: dict[str, str]) -> None:
+        """Identical GPUs (2 x RX 6800) cannot be told apart by name. Windows' Vulkan budget is smaller on the GPU
+        whose VRAM other programs use (the one driving the desktop), and the performance counters show which one that
+        is: pair them by that order when both orders are clear."""
+        used = {g["id"]: g.get("vram_used") for g in (self.last.get("gpus") or [])}
+        by_id = {g.id: g for g in self.gpus}
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for d in devices:
+            gid = mapping.get(d["name"])
+            if gid in by_id and d.get("total_mib") and d.get("free_mib") is not None:
+                groups.setdefault(_norm_name(by_id[gid].name), []).append(d)
+        for devs in groups.values():
+            ids = [mapping[d["name"]] for d in devs]
+            if len(devs) < 2 or any(used.get(i) is None for i in ids):
+                continue
+            eng = sorted(devs, key=lambda d: float(d["total_mib"]) - float(d["free_mib"]))
+            gpus = sorted(ids, key=lambda i: float(used[i]))
+            eng_gap = min(float(b["free_mib"]) - float(a["free_mib"]) for a, b in zip(eng[1:], eng[:-1]))
+            gpu_gap = min(float(used[b]) - float(used[a]) for a, b in zip(gpus[:-1], gpus[1:])) / MiB
+            if eng_gap > 96 and gpu_gap > 96:
+                for d, gid in zip(eng, gpus):
+                    mapping[d["name"]] = gid
+
+    def wait_sample(self, after: float, timeout: float = 2.5) -> dict[str, Any]:
+        """The first telemetry sample taken after ``after`` (a time.time() value), else the latest one."""
+        end = time.monotonic() + timeout
+        while (self.last.get("t") or 0) <= after and time.monotonic() < end and self._thread is not None:
+            time.sleep(0.05)
+        return self.last
+
+    def physical_free_mib(self, sample: dict[str, Any] | None = None) -> dict[str, float]:
+        """gpu id -> MiB of VRAM that no process uses (total minus the dedicated usage of all processes)."""
+        s = self.last if sample is None else sample
+        out: dict[str, float] = {}
+        for g in s.get("gpus") or []:
+            total, used = g.get("vram_total"), g.get("vram_used")
+            if total and used is not None:
+                out[g["id"]] = max(0.0, (float(total) - float(used)) / MiB)
+        return out
 
     # ----- process watch -------------------------------------------------------
 

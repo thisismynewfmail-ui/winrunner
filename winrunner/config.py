@@ -72,6 +72,10 @@ class EngineSettings(_Model):
 class HardwareSettings(_Model):
     vram_margin_mib: int = 512  # left free on every GPU after the model is loaded
     vram_margin_per_device: dict[str, int] = Field(default_factory=dict)
+    # Windows: plan with the physical VRAM that no process uses (what Task Manager shows as free dedicated
+    # memory). The Vulkan driver reports only Windows' per-process budget, which keeps ~0.7-1.2 GB of a 16 GB
+    # card unused. Off: stay within that budget.
+    use_physical_vram: bool = True
     telemetry_interval_s: float = 1.0
 
 

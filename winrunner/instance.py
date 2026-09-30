@@ -122,7 +122,7 @@ class EngineInstance:
         self.client: httpx.AsyncClient | None = None
         self.load_info: dict[str, Any] = {
             "buffers": {}, "breakdown": {}, "offload": None, "kv": None, "ctx": {}, "flash_attn": None,
-            "slots": {}, "mmproj": {}, "template_example": "", "thinking": None, "fit": [], "device_info": {},
+            "slots": {}, "mmproj": {}, "template_example": "", "thinking": None, "fit": [], "device_info": {}, "device_pci": {},
             "backend": {}, "load_seconds": None, "errors": [],
         }
         self.props: dict[str, Any] = {}
@@ -366,6 +366,8 @@ class EngineInstance:
                     li["thinking"] = d["thinking"]
             elif kind == "device_info":
                 li["device_info"][str(d["index"])] = d["info"]
+            elif kind == "device_pci":
+                li["device_pci"][d["device"]] = d["pci"]
             elif kind == "backend":
                 li["backend"].update({k: v for k, v in d.items() if k != "path"})
             elif kind == "error":

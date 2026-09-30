@@ -115,6 +115,8 @@ RULES: list[tuple[re.Pattern, Handler]] = [
     (re.compile(r"(?:llama_server|main): model loaded"), lambda m: ("phase", {"phase": "loaded"})),
     (re.compile(r"(?:server is listening on|listening on) (http\S+)"),
      lambda m: ("phase", {"phase": "ready", "url": m.group(1)})),
+    (re.compile(r"using device (\S+) \((.*)\) \(([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.\d)\) - (\d+) MiB free"),
+     lambda m: ("device_pci", {"device": m.group(1), "pci": m.group(3).lower(), "free_mib": int(m.group(4))})),
     (re.compile(r"ggml_vulkan: Found (\d+) Vulkan devices"), lambda m: ("backend", {"vulkan_devices": int(m.group(1))})),
     (re.compile(r"ggml_vulkan: (\d+) = (.*)"), lambda m: ("device_info", {"index": int(m.group(1)), "info": m.group(2)})),
     (re.compile(r"ggml_cuda_init: found (\d+) (ROCm|CUDA) devices"),
