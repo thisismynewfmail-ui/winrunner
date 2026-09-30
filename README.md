@@ -7,9 +7,9 @@ network through an **OpenAI- and LM Studio-compatible API** at
 http://<this-computer>:5070/v1
 ```
 
-It drives the official [llama.cpp](https://github.com/ggml-org/llama.cpp) engine (`llama-server`), plans GPU
-memory for the context length you ask for, passes each model's own GGUF settings and chat template through
-unchanged, pairs vision projectors (mmproj) automatically, and ships a full control panel with live
+It drives the official [llama.cpp](https://github.com/ggml-org/llama.cpp) engine (`llama-server`), keeps the whole
+model on your GPUs and fills their memory with context, passes each model's own GGUF settings and chat template
+through unchanged, pairs vision projectors (mmproj) automatically, and ships a full control panel with live
 monitoring, laid out for portrait monitors.
 
 Target system this release is tuned for: **Windows 10 x64 · AMD Ryzen 5 3600 · 64 GB RAM · 2 × AMD Radeon RX 6800 (16 GB)**.
@@ -168,31 +168,52 @@ print(r.choices[0].message.content)
 
 ## GPU allocation and context length
 
-The default context is **65,536 tokens**. Before every load WinRunner plans memory for the chosen context:
+The default context is **65,536 tokens**. In automatic allocation WinRunner keeps the **whole model on the GPUs**
+whenever it fits with at least a 4,096-token context, and sizes the context to the VRAM. Before every load:
 
 1. **Context.** The requested length is clamped to the model's trained context unless you tick
    *Allow above trained context*, which uses RoPE scaling.
 2. **KV cache precision.** *Auto* keeps an **F16** cache. It switches to **Q8_0** (near-lossless, half the size)
-   only if that is what allows the entire model plus the full context to stay in VRAM. Q4 is never chosen
-   automatically.
-3. **Devices.** Free VRAM of each GPU is read from the engine itself (`llama-server --list-devices`), minus a
-   safety margin (1 GiB per GPU by default; adjustable, also per GPU).
-4. **Layer split.** Layers are assigned to GPUs in contiguous ranges sized by each layer's real cost:
-   weights + KV cache, with the output layer on the last GPU and the vision projector and compute buffers
-   accounted for. This mirrors llama.cpp's own assignment (`--tensor-split`).
-5. **If the model does not fit.**
+   only if F16 cannot reach the requested context in VRAM. Q4 is never chosen automatically.
+3. **Devices.** Free VRAM of each GPU is read from the engine itself (`llama-server --list-devices`). It already
+   excludes what other programs use; a safety margin stays free on top of that (256 MiB per GPU by default;
+   adjustable, also per GPU).
+4. **Context in VRAM** (load setting):
+   - *Fill VRAM* (default): the largest context that fits. The KV cache takes the free VRAM, so the GPUs are used up
+     to the safety margin (a 16 GB card ends up at about 15.8 GB). The context grows beyond the requested length, up
+     to the trained context, and shrinks below it when the whole model would not fit otherwise.
+   - *Up to requested*: the requested length, reduced only when the whole model would not fit otherwise.
+   - *Exact*: always the requested length. If it does not fit, part of the model runs from system RAM (step 7).
+
+   The memory plan and the activity log show when the context was raised or reduced.
+5. **Layer split.** Layers are assigned to GPUs in contiguous ranges sized by each layer's real cost (weights + KV
+   cache), so all GPUs fill up at the same rate. The output layer, the compute buffers (including the input copies
+   llama.cpp keeps when it runs the GPUs as a pipeline), the vision projector and the GPU backend's run-time scratch
+   memory (for example flash attention's F16 copy of a Q8_0 KV cache) are accounted for. The layout is passed to the
+   engine explicitly (`-ngl all --tensor-split …`).
+6. **Engine verification.** Builds that include `llama-fit-params` (all current releases) measure the layout with
+   llama.cpp's own allocator before loading. WinRunner calibrates its estimate with the measurement, per GPU, until
+   the measured layout is the one it chooses (usually 1 to 3 measurements), so the loaded model fills the GPUs
+   without overcommitting them.
+7. **If the model does not fit even at 4,096 tokens.**
    - *Mixture-of-experts models:* all attention and KV stay on the GPUs and only the expert weights of the first
      N layers move to system RAM (`--n-cpu-moe`). This is much faster than moving whole layers.
    - *Dense models:* the minimum number of layers runs on the CPU.
-6. **Engine verification.** Builds that include `llama-fit-params` (all current releases) verify the plan with
-   llama.cpp's own allocator before loading. In automatic mode the engine's `--fit` then places layers within
-   your safety margins.
+
+   With engine builds that have `--fit`, llama.cpp itself places what does not fit, within the same margins.
+
+Why the context gives way first: when any part of a model is in system RAM, llama.cpp runs the attention of those
+layers on the CPU, copies their weights to the first GPU for every batch of the prompt, and no longer runs the GPUs
+as a pipeline. Prompt processing becomes many times slower, with the first GPU and the CPU busy while the other GPU
+waits, even when only two layers are affected.
 
 The **Library › Load** tab shows all of this before you load: per-GPU stacked bars (weights, KV cache, compute
 buffers, vision projector, margin, free), a per-layer placement map, the largest context that still fits entirely
-in VRAM for F16 and Q8_0, and the exact `llama-server` command line.
+in VRAM for F16 and Q8_0, and the exact `llama-server` command line. *Verify with engine* runs the engine
+measurement; loading always runs it.
 
-*Manual* mode lets you set GPU layers, tensor split, main GPU, split mode and MoE CPU layers yourself.
+*Manual* mode lets you set GPU layers, tensor split, main GPU, split mode and MoE CPU layers yourself. The context
+is fitted to that layout in the same way (choose *Exact* to keep it as requested).
 
 ## GGUF settings and chat templates
 
@@ -245,7 +266,9 @@ What WinRunner does by default on this machine, and why:
 | Multi-GPU | **Layer split** across both RX 6800 | Only small activations cross PCIe between GPUs, so a secondary slot running at x4/x8 costs little. Row split needs fast inter-GPU links and is not recommended. |
 | Tensor split | Computed per model | Balances weights + KV per GPU. The display GPU usually has less free VRAM; the plan uses the measured free memory. |
 | Flash attention | Auto | Removes the huge attention scratch buffer at long context (tens of GiB at 64K without it). Required for a quantized V cache. |
-| KV cache | F16 → Q8_0 only if needed | Highest quality that still keeps the whole model in 32 GB of VRAM. |
+| Context in VRAM | Fill VRAM | The whole model stays on the GPUs and the KV cache takes the rest: about 15.8 of 16 GB in use per GPU. |
+| VRAM safety margin | 256 MiB per GPU | The driver's free-memory figure already excludes other programs. Raise it for the display GPU if you run VRAM-hungry programs while a model is loaded. |
+| KV cache | F16 → Q8_0 only if needed | Highest quality that still reaches the requested context with the whole model in 32 GB of VRAM. |
 | Loading | Full read when fully offloaded, otherwise mmap | Faster, measurable loads straight into VRAM on Windows. mmap for partial offload avoids a second RAM copy. |
 | Threads | Engine default (6 = physical cores) | With full offload the CPU only schedules work, so SMT threads do not help. |
 | Process priority | Above normal | Keeps token generation smooth while you use the desktop. |
@@ -254,7 +277,8 @@ What WinRunner does by default on this machine, and why:
 | Large MoE models | Experts in RAM | 64 GB RAM plus 32 GB VRAM run models like gpt-oss-120b / GLM-4.5-Air with attention on the GPUs. |
 
 Rough sizes for 2 × 16 GB, fully offloaded at 64K context: 7–14B models at Q8_0/Q6_K with an F16 KV cache;
-24–32B models at Q4_K_M with a Q8_0 KV cache. Use **Library › Load › Max full-offload ctx** to see the exact limit for each model.
+24–32B models at Q4_K_M with a Q8_0 KV cache. Larger combinations, such as a 24B model at Q8_0, stay fully on the
+GPUs with a somewhat smaller context. Use **Library › Load › Max full-offload ctx** to see the exact limit for each model.
 
 ### Vulkan or ROCm?
 
@@ -349,6 +373,7 @@ The whole folder is portable. Set `WINRUNNER_DATA` or `--data-dir` to keep data 
 | "No llama.cpp engine installed" | Settings › Engine › *Check for llama.cpp releases* › Install (Vulkan). |
 | Engine reports no GPUs | Update the Adrenalin driver; *Re-detect engine and devices*. For ROCm builds install the AMD HIP SDK. |
 | Load fails with out-of-memory | Lower the context, set KV cache to Q8_0, or raise the safety margin if other applications use VRAM. The memory plan shows the largest context that fits. |
+| Prompt processing is very slow; one GPU and the CPU are busy while the other GPU idles; VRAM is not full | Part of the model runs from system RAM. With *Context in VRAM: Fill VRAM* (default) that only happens when the model does not fit even with a 4,096-token context. Check the memory plan (**FULL GPU OFFLOAD**) and the activity log line *Placement: …*; if *Context in VRAM* is *Exact*, switch it back to *Fill VRAM* or lower the context. |
 | Port 5070 already in use | Close the other program (e.g. a second WinRunner) or change the port in Settings › Network (restart required). |
 | Model answers in a strange format | Keep *Template source: GGUF embedded*. Check the Chat Template tab; some old GGUFs have no template and need a built-in one. |
 | Images rejected | The model needs its mmproj file in the same folder (Vision tab). |
@@ -389,7 +414,9 @@ python -m pytest
 The unit tests cover GGUF parsing, the memory planner, log parsing, command-line generation, image normalisation,
 the stream proxy and settings. `tests\test_recovery.py` checks engine failure recovery end to end: it runs the full
 server against a scripted fake `llama-server` (`tests\fake_engine.py`, Linux only) that loses its GPU, aborts or
-crashes while idle.
+crashes while idle. `tests\test_vram_fill.py` runs the engine verification end to end against a fake
+`llama-fit-params` (`tests\fake_fit_params.py`) whose measurements differ from WinRunner's estimate by a known amount,
+and checks that the calibrated plan fills the GPUs without overcommitting them.
 
 `tests\test_integration.py` runs the full server against a real engine. Set these first:
 

@@ -132,9 +132,12 @@ def recommendations(sysinfo: dict[str, Any]) -> list[dict[str, str]]:
     total_vram = sum(g.get("vram_total") or 0 for g in gpus)
     if total_vram:
         out.append({"title": "Context length and KV cache",
-                    "text": f"{total_vram / GiB:.0f} GiB total VRAM. WinRunner keeps the KV cache at F16 when the "
-                            "requested context fits and switches to Q8_0 (near-lossless, half the size) only when that "
-                            "is what allows the whole model to stay on the GPUs."})
+                    "text": f"{total_vram / GiB:.0f} GiB total VRAM. WinRunner keeps the whole model on the GPUs "
+                            "whenever it fits with at least a 4K context, and gives the rest of the VRAM to the KV "
+                            "cache (Context in VRAM: Fill), so the GPUs are used up to the safety margin. Running any "
+                            "part of a model from system RAM makes prompt processing many times slower. The KV cache "
+                            "stays F16 when the requested context fits and switches to Q8_0 (near-lossless, half the "
+                            "size) only when that is what reaches it."})
     return out
 
 

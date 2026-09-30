@@ -45,7 +45,11 @@ def _ngl(engine: EngineInfo, n: int, n_layer: int) -> str:
 
 
 def gpu_args(engine: EngineInfo, p: LoadParams, plan: Plan, device_names: list[str]) -> list[str]:
-    """Device placement arguments (shared by server, fit-params and bench)."""
+    """Device placement arguments (shared by server, fit-params and bench).
+
+    Plans that keep the whole model in VRAM always pass their layout explicitly: llama.cpp's --fit can only meet
+    an explicit context size by moving layers into system RAM, which is what the plan avoids.
+    """
     a: list[str] = []
     if p.devices and engine.has("--device", "-dev"):
         a += ["--device", ",".join(p.devices)]
@@ -69,20 +73,22 @@ def gpu_args(engine: EngineInfo, p: LoadParams, plan: Plan, device_names: list[s
     return a
 
 
-def fit_args(engine: EngineInfo, plan: Plan, margins: list[int]) -> list[str]:
+def fit_args(engine: EngineInfo, plan: Plan, targets: list[int]) -> list[str]:
+    """``targets``: MiB the engine's --fit keeps free per device (safety margin + run-time scratch)."""
     a: list[str] = []
     if not engine.has("--fit", "-fit"):
         return a
     if plan.use_engine_fit:
         a += ["--fit", "on"]
-        if margins and engine.has("--fit-target", "-fitt"):
-            a += ["--fit-target", ",".join(str(int(m)) for m in margins)]
+        if targets and engine.has("--fit-target", "-fitt"):
+            a += ["--fit-target", ",".join(str(int(m)) for m in targets)]
     else:
         a += ["--fit", "off"]
     return a
 
 
-def context_args(engine: EngineInfo, p: LoadParams, plan: Plan) -> list[str]:
+def context_args(engine: EngineInfo, p: LoadParams, plan: Plan, server: bool = True) -> list[str]:
+    """Context arguments; ``server=False`` leaves out the ones llama-fit-params must not get (slots, threads)."""
     a = ["-c", str(plan.ctx)]
     if p.batch_size != 2048:
         a += ["-b", str(p.batch_size)]
@@ -101,21 +107,24 @@ def context_args(engine: EngineInfo, p: LoadParams, plan: Plan) -> list[str]:
         a += ["-nkvo"]
     if p.swa_full and engine.has("--swa-full"):
         a += ["--swa-full"]
-    if plan.parallel and plan.parallel > 0:
-        a += ["-np", str(plan.parallel)]
-    if p.threads > 0:
-        a += ["-t", str(p.threads)]
-    if p.threads_batch > 0:
-        a += ["-tb", str(p.threads_batch)]
-    lm = plan.load_mode
-    if engine.has("--load-mode", "-lm"):
-        if lm and lm != "auto":
-            a += ["--load-mode", lm]
-    else:  # older builds
-        if lm == "none" and engine.has("--no-mmap"):
-            a += ["--no-mmap"]
-        if "mlock" in lm and engine.has("--mlock"):
-            a += ["--mlock"]
+    if server:
+        # llama-fit-params gets no -np: without --kv-unified (a server option) it would lay out a separate cache
+        # per slot; the planner adds the memory of the slots' sliding windows itself.
+        if plan.parallel and plan.parallel > 0:
+            a += ["-np", str(plan.parallel)]
+        if p.threads > 0:
+            a += ["-t", str(p.threads)]
+        if p.threads_batch > 0:
+            a += ["-tb", str(p.threads_batch)]
+        lm = plan.load_mode
+        if engine.has("--load-mode", "-lm"):
+            if lm and lm != "auto":
+                a += ["--load-mode", lm]
+        else:  # older builds
+            if lm == "none" and engine.has("--no-mmap"):
+                a += ["--no-mmap"]
+            if "mlock" in lm and engine.has("--mlock"):
+                a += ["--mlock"]
     if p.rope_scaling:
         a += ["--rope-scaling", p.rope_scaling]
     if p.rope_freq_base > 0:
@@ -141,7 +150,7 @@ def build_server_args(
     template_file: str | None,
     is_embedding: bool,
     verbosity: int,
-    margins: list[int],
+    fit_targets: list[int],
 ) -> LaunchSpec:
     notes: list[str] = []
     a = [engine.path, "-m", model_path, "--host", "127.0.0.1", "--port", str(port)]
@@ -151,7 +160,7 @@ def build_server_args(
         a += ["--api-key", api_key]
     a += context_args(engine, p, plan)
     a += gpu_args(engine, p, plan, device_names)
-    a += fit_args(engine, plan, margins)
+    a += fit_args(engine, plan, fit_targets)
 
     if plan.parallel and plan.parallel > 1 and engine.has("--kv-unified", "-kvu"):
         a += ["--kv-unified"]  # every slot may use the whole context; memory is shared
@@ -229,28 +238,31 @@ def build_server_args(
 
 
 def build_fit_args(engine: EngineInfo, model_path: str, p: LoadParams, plan: Plan, device_names: list[str],
-                   margins: list[int], print_mode: bool) -> list[str] | None:
-    """Arguments for llama-fit-params (engine-side memory projection)."""
+                   targets: list[int], print_mode: bool) -> list[str] | None:
+    """Arguments for llama-fit-params (engine-side memory projection).
+
+    ``print_mode``: measure exactly the plan's layout (``--fit-print``: MiB of weights, context and compute
+    buffers per device). Otherwise the engine fits layers itself, keeping ``targets`` MiB free per device.
+    """
     if not engine.fit_params:
         return None
     a = [engine.fit_params, "-m", model_path]
-    a += [x for x in context_args(engine, p, plan)]
-    if plan.use_engine_fit and not print_mode:
-        a += gpu_args(engine, p, plan, device_names)
-        if engine.has("--fit-target", "-fitt") and margins:
-            a += ["--fit-target", ",".join(str(int(m)) for m in margins)]
-    else:
-        a += gpu_args(engine, p, _explicit(plan), device_names)
+    a += context_args(engine, p, plan, server=False)
     if print_mode:
+        a += gpu_args(engine, p, _explicit(plan), device_names)
         a += ["--fit-print", "on"]
+    else:
+        a += gpu_args(engine, p, _explicit(plan, engine_fit=True), device_names)
+        if engine.has("--fit-target", "-fitt") and targets:
+            a += ["--fit-target", ",".join(str(int(m)) for m in targets)]
     return a
 
 
-def _explicit(plan: Plan) -> Plan:
+def _explicit(plan: Plan, engine_fit: bool = False) -> Plan:
     import copy
 
     q = copy.copy(plan)
-    q.use_engine_fit = False
+    q.use_engine_fit = engine_fit
     return q
 
 

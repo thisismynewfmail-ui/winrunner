@@ -237,12 +237,15 @@ export function mount(root) {
       const cls = !r.devices?.length ? 'warn' : full ? 'ok' : 'warn';
       const headline = !r.devices?.length ? 'CPU ONLY' : full ? 'FULL GPU OFFLOAD' : p.n_cpu_moe ? 'GPU + EXPERTS IN RAM' : 'PARTIAL OFFLOAD';
       planStatus.append(h('span', { class: `led ${cls === 'ok' ? 'ok' : 'warn'}` }), h('b', { class: cls }, headline),
-        h('span', { class: 'dim' }, p.source === 'engine' ? 'verified by engine projection (llama-fit-params)' : p.use_engine_fit ? 'estimate · engine fits layers at load' : 'estimate'));
+        h('span', { class: 'dim' }, p.source === 'engine' ? 'verified by engine projection (llama-fit-params)' : p.use_engine_fit ? 'estimate · engine fits layers at load' : 'estimate · verified by the engine at load'));
       clear(planStats);
       const vramUsed = p.devices.reduce((a, x) => a + x.used_mib, 0);
       const vramFree = p.devices.reduce((a, x) => a + x.free_mib - x.margin_mib, 0);
+      const ctxSub = p.ctx_adjusted === 'raised' ? `Raised to fill VRAM (requested ${fmt.num(p.ctx_target)})`
+        : p.ctx_adjusted === 'reduced' ? `Reduced to keep the model in VRAM (requested ${fmt.num(p.ctx_target)})`
+          : p.ctx !== p.ctx_requested ? `Requested ${fmt.num(p.ctx_requested)}` : null;
       planStats.append(
-        stat('Context', fmt.num(p.ctx), p.ctx !== p.ctx_requested ? `Requested ${fmt.num(p.ctx_requested)}` : null),
+        stat('Context', fmt.num(p.ctx), ctxSub),
         stat('KV cache', `${p.kv_k.toUpperCase()} · ${fmt.mib(p.totals.kv_mib)}`, `${fmt.bytes(p.kv_bytes_per_token)} per token`),
         stat('Flash attn', p.flash_attn),
         stat('GPU layers', `${Math.min(p.gpu_layers, p.n_layer + 1)}/${p.n_layer + 1}`),

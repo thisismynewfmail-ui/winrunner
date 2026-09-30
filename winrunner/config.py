@@ -25,6 +25,13 @@ log = logging.getLogger("winrunner.config")
 KV_TYPES = ["f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "f32"]
 QUANTIZED_KV = {"q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl"}
 
+# VRAM kept free on every GPU. The free memory the engine reports already excludes what other programs use, and
+# the run-time scratch buffers of the GPU backends are planned for explicitly, so a small margin fills a 16 GB
+# card to about 15.8 GB.
+DEFAULT_VRAM_MARGIN_MIB = 256
+SETTINGS_VERSION = 2
+_V1_VRAM_MARGIN_MIB = 1024  # default of settings version 1
+
 
 class _Model(BaseModel):
     model_config = ConfigDict(extra="ignore", validate_assignment=True)
@@ -64,7 +71,7 @@ class EngineSettings(_Model):
 
 
 class HardwareSettings(_Model):
-    vram_margin_mib: int = 1024
+    vram_margin_mib: int = DEFAULT_VRAM_MARGIN_MIB
     vram_margin_per_device: dict[str, int] = Field(default_factory=dict)
     telemetry_interval_s: float = 1.0
 
@@ -74,6 +81,11 @@ class LoadParams(_Model):
 
     context_length: int = 65536
     allow_context_over_train: bool = False
+    # How the context is fitted to the VRAM (the whole model stays on the GPUs whenever it fits at 4K context):
+    #   fill - the largest context that fits: the KV cache takes the free VRAM, up to the trained context
+    #   fit  - the requested context, reduced when needed so the model does not spill into system RAM
+    #   off  - exactly the requested context (automatic allocation then moves layers to system RAM if needed)
+    context_fit: Literal["fill", "fit", "off"] = "fill"
     gpu_offload: Literal["auto", "manual"] = "auto"
     n_gpu_layers: int = -1  # manual mode: -1 = all layers
     n_cpu_moe: int = 0  # manual mode
@@ -190,7 +202,7 @@ class StartupSettings(_Model):
 
 
 class Settings(_Model):
-    version: int = 1
+    version: int = SETTINGS_VERSION
     server: ServerSettings = Field(default_factory=ServerSettings)
     engine: EngineSettings = Field(default_factory=EngineSettings)
     hardware: HardwareSettings = Field(default_factory=HardwareSettings)
@@ -218,6 +230,18 @@ def deep_merge(base: dict, patch: dict) -> dict:
         else:
             out[k] = copy.deepcopy(v)
     return out
+
+
+def migrate(raw: dict) -> bool:
+    """Upgrade a settings file written by an older version in place; True if anything changed."""
+    version = raw.get("version", 1)
+    if not isinstance(version, int) or version >= SETTINGS_VERSION:
+        return False
+    hw = raw.get("hardware")
+    if isinstance(hw, dict) and hw.get("vram_margin_mib") == _V1_VRAM_MARGIN_MIB:
+        hw["vram_margin_mib"] = DEFAULT_VRAM_MARGIN_MIB  # still the old default: use the new one
+    raw["version"] = SETTINGS_VERSION
+    return True
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -255,7 +279,11 @@ class SettingsStore:
             return s
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            return Settings.model_validate(raw)
+            migrated = isinstance(raw, dict) and migrate(raw)
+            s = Settings.model_validate(raw)
+            if migrated:
+                _atomic_write_json(self.path, s.model_dump(mode="json"))
+            return s
         except Exception as exc:  # corrupt or invalid file: keep a backup, start clean
             backup = self.path.with_suffix(f".invalid-{int(time.time())}.json")
             try:

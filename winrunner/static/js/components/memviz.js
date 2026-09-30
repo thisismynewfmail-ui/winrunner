@@ -70,7 +70,9 @@ export function memBars() {
 export function planDevices(plan) {
   return (plan.devices || []).map((d, i) => ({
     name: d.name, description: d.description, total: d.total_mib, free: d.free_mib,
-    weights: d.weights_mib + (d.output_mib || 0), kv: d.kv_mib, compute: d.compute_mib, mmproj: d.mmproj_mib,
+    // compute includes the backend's run-time scratch (e.g. flash attention's F16 copy of a quantized KV cache)
+    weights: d.weights_mib + (d.output_mib || 0), kv: d.kv_mib,
+    compute: Math.max(0, d.compute_mib + (d.scratch_mib || 0) + (d.calib_mib || 0)), mmproj: d.mmproj_mib,
     draft: d.draft_mib, margin: d.margin_mib, color: DEV_COLORS[i % DEV_COLORS.length],
   }));
 }

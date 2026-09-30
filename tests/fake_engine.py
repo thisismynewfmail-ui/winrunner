@@ -8,6 +8,8 @@ scripted through environment variables:
 ``FAKE_ENGINE_STATE``  directory for the start counter (``starts``)
 ``FAKE_ENGINE_ERRORS`` ``data`` (``data: {"error": ...}``, default) or ``legacy`` (``error: {...}``)
 ``FAKE_ENGINE_RESET_POLLS`` after an abort, ``--list-devices`` reports no GPU this many times (a GPU reset)
+``FAKE_ENGINE_DEVICES`` GPUs for ``--list-devices``: ``name:description:total MiB:free MiB;...``
+``FAKE_ENGINE_HELP``   ``modern``: ``--help`` lists the memory fitting and multi-GPU options of current builds
 
 Modes:
   ok                        answers every request
@@ -42,6 +44,29 @@ HELP = """
 -lv,   --verbosity, --log-verbosity N   Set the verbosity threshold.
 --log-jsonl, --no-log-jsonl             Log as JSONL
 """
+
+HELP_MODERN = """
+-ts,   --tensor-split N0,N1,N2,...      fraction of the model to offload to each GPU
+-fit,  --fit [on|off]                   whether to adjust unset arguments to fit in device memory
+-fitt, --fit-target MiB0,MiB1,MiB2,...  target margin per device for --fit
+-ncmoe, --n-cpu-moe N                   keep the Mixture of Experts (MoE) weights of the first N layers in the CPU
+-ctk,  --cache-type-k TYPE              KV cache data type for K
+-ctv,  --cache-type-v TYPE              KV cache data type for V
+-lm,   --load-mode MODE                 model loading mode (default: auto)
+-np,   --parallel N                     number of server slots (default: -1, -1 = auto)
+-kvu,  --kv-unified, -no-kvu, --no-kv-unified
+-dev,  --device <dev1,dev2,..>          comma-separated list of devices to use for offloading
+"""
+
+
+def device_list() -> list[str]:
+    spec = os.environ.get("FAKE_ENGINE_DEVICES") or "Vulkan0:Fake GPU:16368:15000"
+    out = []
+    for item in spec.split(";"):
+        name, desc, total, free = item.split(":")
+        out.append(f"  {name}: {desc} ({total} MiB, {free} MiB free)")
+    return out
+
 
 DEVICE_LOST = "decode() failed: vk::Queue::submit: ErrorDeviceLost"
 MODE = "ok"
@@ -200,7 +225,7 @@ def main(argv: list[str]) -> int:
         print("version: 9999 (abcdef1)")
         return 0
     if "--help" in argv:
-        print(HELP)
+        print(HELP + (HELP_MODERN if os.environ.get("FAKE_ENGINE_HELP") == "modern" else ""))
         return 0
     if "--list-devices" in argv:
         gone = os.path.join(os.environ.get("FAKE_ENGINE_STATE", "."), "devices_gone")
@@ -214,7 +239,7 @@ def main(argv: list[str]) -> int:
                 f.write(str(left - 1))
             print("Available devices:")
             return 0
-        print("Available devices:\n  Vulkan0: Fake GPU (16368 MiB, 15000 MiB free)")
+        print("\n".join(["Available devices:"] + device_list()))
         return 0
     port = int(argv[argv.index("--port") + 1])
     JSONL = "--log-jsonl" in argv

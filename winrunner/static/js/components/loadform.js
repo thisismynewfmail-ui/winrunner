@@ -77,12 +77,19 @@ export function loadForm(opts) {
     row('Above trained context', 'allow_context_over_train',
       toggle('Allow (RoPE scaling)', v.allow_context_over_train, (x) => { set('allow_context_over_train', x); updateCtxHint(); }),
       null, 'Without this, contexts above the model\'s trained length are clamped to it.');
+    row('Context in VRAM', 'context_fit', seg([
+      ['fill', 'Fill VRAM', 'Use the largest context that fits: the KV cache takes the free VRAM (up to the trained context). If the requested length does not fit, it is reduced so the whole model stays on the GPUs.'],
+      ['fit', 'Up to requested', 'Use the requested length, reduced only when it does not fit, so the whole model stays on the GPUs.'],
+      ['off', 'Exact', 'Always use the requested length. If it does not fit, part of the model runs from system RAM: prompt processing becomes many times slower.'],
+    ], v.context_fit, (x) => set('context_fit', x)),
+    'Fill VRAM (default) uses the GPUs up to the safety margin; the requested length decides the KV cache precision.',
+    'Running any part of a model from system RAM is very slow in llama.cpp, so the context is fitted first (down to 4,096 tokens).');
 
     // ---- GPU offload ------------------------------------------------------
     sec('GPU offload');
     const manualBox = h('div', { class: 'col grow', style: { gap: '6px' } });
-    row('Allocation', 'gpu_offload', seg([['auto', 'Automatic', 'Fit layers, KV cache and buffers to free VRAM'], ['manual', 'Manual']],
-      v.gpu_offload, (x) => { set('gpu_offload', x); renderManual(); }), 'Automatic uses the memory planner and the engine\'s own projection.');
+    row('Allocation', 'gpu_offload', seg([['auto', 'Automatic', 'Keep the whole model on the GPUs and fit the context and buffers to free VRAM'], ['manual', 'Manual']],
+      v.gpu_offload, (x) => { set('gpu_offload', x); renderManual(); }), 'Automatic keeps the whole model in VRAM whenever it fits and verifies the layout with the engine\'s own projection.');
     formRow(f, '', manualBox);
     const renderManual = () => {
       clear(manualBox);
@@ -145,7 +152,7 @@ export function loadForm(opts) {
       'Fused attention kernel: far smaller compute buffers at long context. Required for a quantized V cache.',
       'Supported by the Vulkan and ROCm backends on RDNA2.');
     row('KV cache type', 'kv_cache_type', select(KV_OPTS, v.kv_cache_type, (x) => set('kv_cache_type', x), { style: { minWidth: '240px' } }),
-      'Precision of the attention key/value cache. Auto keeps F16 and uses Q8_0 only if that enables a full GPU offload.');
+      'Precision of the attention key/value cache. Auto keeps F16 and uses Q8_0 only when F16 cannot reach the requested context in VRAM.');
     row('V cache type', 'kv_cache_type_v', select([['', 'Same as K'], ...KV_OPTS.filter(([k]) => k !== 'auto')], v.kv_cache_type_v,
       (x) => set('kv_cache_type_v', x)), null, 'Separate precision for the value cache (advanced).');
     row('KV cache on GPU', 'kv_offload', toggle('Offload KV cache', v.kv_offload, (x) => set('kv_offload', x)), null,

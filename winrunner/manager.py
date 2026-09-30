@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import subprocess
 import time
@@ -22,7 +24,7 @@ from .hardware import HardwareMonitor
 from .instance import EngineInstance
 from .library import ModelEntry, ModelLibrary
 from .paths import IS_WINDOWS, DataPaths
-from .planner import Plan, Planner, parse_fit_args, parse_fit_print
+from .planner import FIT_CTX_MIN, DevicePlan, Plan, Planner, assign_layers, parse_fit_args, parse_fit_print
 from .util import free_port, new_id
 
 log = logging.getLogger("winrunner.manager")
@@ -39,6 +41,13 @@ DEVICE_SETTLE_MIB = 256  # free VRAM counts as settled when it grows less than t
 
 SOURCE_LABELS = {"jit": "JIT request", "ui": "control panel", "startup": "startup", "recovery": "automatic restart"}
 _RECOVERY_ABORTS = ("shutting_down", "model_replaced")  # reasons to stop a recovery at once (no retries)
+
+# Engine projection (llama-fit-params) of a plan
+MAX_PROJECTIONS = 5  # measurements per plan: the estimate is calibrated until the measured layout is the chosen one
+CALIB_MIN_SPAN = 2048  # context tokens between two measurements before their difference is used as a slope
+PROJECTION_ROUNDING_MIB = 3  # llama-fit-params prints whole MiB (rounded down) for 3 buffers per device
+PLAN_CACHE_S = 120.0
+FIT_TIMEOUT_S = 180.0
 
 
 class ModelError(Exception):
@@ -152,6 +161,22 @@ class ModelManager:
         sel = [d for d in devices if not p.devices or d.name in p.devices]
         return [int(hw.vram_margin_per_device.get(d.name, hw.vram_margin_mib)) for d in sel]
 
+    def _fit_targets(self, devices: list[EngineDevice], p: LoadParams, pl: Plan, projection: bool = False) -> list[int]:
+        """MiB that llama.cpp's --fit keeps free per device: the safety margin plus what its projection misses.
+
+        The engine does not see the run-time scratch buffers of the GPU backend. ``projection``: targets for
+        llama-fit-params, which in addition loads neither the vision projector nor the other server slots.
+        """
+        plans = {d.name: d for d in pl.devices}
+        out = []
+        for d, margin in zip([d for d in devices if not p.devices or d.name in p.devices], self._margins(devices, p)):
+            dp = plans.get(d.name)
+            extra = dp.scratch_mib if dp else 0.0
+            if dp and projection:
+                extra += dp.swa_extra_mib + dp.mmproj_mib
+            out.append(int(margin + math.ceil(extra)))
+        return out
+
     def _reclaim(self, evicting: list[EngineInstance]) -> dict[str, float]:
         """VRAM that loaded instances would free if they are evicted."""
         out: dict[str, float] = {}
@@ -176,7 +201,8 @@ class ModelManager:
             raise ModelError(f"model '{model_id}' not found in library", 404, "model_not_found")
         eng = await self.engine_async()
         p = self.store.effective_load_params(entry.path, overrides)
-        devices, dev_err = await self.devices(max_age=3.0)
+        # an engine projection is compared with the free VRAM right now
+        devices, dev_err = await self.devices(max_age=0.0 if verify else 3.0)
         evicting = self._evict_set(entry.id) if assume_evict else []
         mmproj = self._mmproj_for(entry, p)
         mm_size = 0
@@ -188,19 +214,24 @@ class ModelManager:
                 mm_size = 0
             mm_hint = self.store.profile(entry.path).mmproj_est_mib or None
         draft = self._draft_for(p)
-        planner = Planner(
-            entry.info, p, devices, self.device_map(devices),
-            margin_mib=self.store.settings.hardware.vram_margin_mib,
-            margin_per_device=self.store.settings.hardware.vram_margin_per_device,
-            reclaim_mib=self._reclaim(evicting),
-            mmproj_size=mm_size, mmproj_mib_hint=mm_hint,
-            draft_info=draft.info if draft else None,
-            engine_fit=bool(eng and self.store.settings.engine.use_engine_fit and eng.has("--fit", "-fit")),
-            model_id=entry.id,
-        )
-        pl = planner.plan()
-        pl.mmproj = mmproj or ""
-        pl.draft = draft.path if draft else ""
+        hw = self.store.settings.hardware
+        reclaim = self._reclaim(evicting)
+        engine_fit = bool(eng and self.store.settings.engine.use_engine_fit and eng.has("--fit", "-fit"))
+
+        def planner(calibration: dict[str, tuple[float, float]] | None = None) -> Planner:
+            return Planner(
+                entry.info, p, devices, self.device_map(devices),
+                margin_mib=hw.vram_margin_mib,
+                margin_per_device=hw.vram_margin_per_device,
+                reclaim_mib=reclaim,
+                mmproj_size=mm_size, mmproj_mib_hint=mm_hint,
+                draft_info=draft.info if draft else None,
+                engine_fit=engine_fit,
+                model_id=entry.id,
+                calibration=calibration,
+            )
+
+        pl = planner().plan()
         if pl.use_engine_fit and evicting:
             # the engine measures free memory itself; the evicted model is still resident during planning
             pl.notes.append("Memory projection accounts for the currently loaded model being unloaded first.")
@@ -214,7 +245,7 @@ class ModelManager:
         }
         if verify and eng and eng.fit_params and devices and not evicting:
             try:
-                await self._verify_with_engine(eng, entry, p, pl, devices)
+                pl = await self._verify_with_engine(eng, entry, p, pl, devices, planner, mmproj, draft)
             except Exception as exc:  # projection is advisory; never block a load on it
                 pl.warnings.append(f"Engine memory projection failed: {exc}")
         elif verify and evicting:
@@ -223,12 +254,14 @@ class ModelManager:
                             "after the current model is unloaded.")
         elif verify and eng and not eng.fit_params:
             pl.notes.append("This engine build does not include llama-fit-params; the analytic estimate is used.")
+        pl.mmproj = mmproj or ""
+        pl.draft = draft.path if draft else ""
         if eng:
             sel = [d.name for d in devices if not p.devices or d.name in p.devices]
             spec = build_server_args(
                 eng, entry.path, p, pl, sel, 0, entry.id, "", mmproj, draft.path if draft else None,
                 self._template_file(entry, p), entry.info.kind == "embedding",
-                self.store.settings.engine.log_verbosity, self._margins(devices, p),
+                self.store.settings.engine.log_verbosity, self._fit_targets(devices, p, pl),
             )
             args = [a for a in spec.args]
             i = args.index("--port")
@@ -237,98 +270,224 @@ class ModelManager:
         return pl, extra
 
     async def _verify_with_engine(self, eng: EngineInfo, entry: ModelEntry, p: LoadParams, pl: Plan,
-                                  devices: list[EngineDevice]) -> None:
+                                  devices: list[EngineDevice], planner: Callable[..., Planner], mmproj: str | None,
+                                  draft: ModelEntry | None) -> Plan:
+        """Measure the plan with llama.cpp's own allocator (llama-fit-params) and refine it.
+
+        llama.cpp's projection is exact for what it allocates at load (weights, KV cache, compute buffers). The
+        estimate is calibrated with it, per device, until the measured layout is the one the planner chooses, so
+        the context fills the GPUs up to the safety margins without spilling. A plan that leaves part of the model
+        in system RAM is placed by the engine's own --fit at load; its layout is shown.
+        """
         sel = [d.name for d in devices if not p.devices or d.name in p.devices]
-        margins = self._margins(devices, p)
-        if pl.mmproj and margins and p.mmproj_offload:
-            margins = [margins[0] + int(pl.totals.get("mmproj_mib", 0))] + margins[1:]
-        key_src = json.dumps([entry.path, entry.info.mtime, p.model_dump(mode="json"), pl.ctx, pl.kv_k,
-                              [(d.name, d.free_mib // 256) for d in devices], eng.path], sort_keys=True)
+        key_src = json.dumps([entry.path, entry.info.mtime, p.model_dump(mode="json"), eng.path, mmproj or "",
+                              draft.path if draft else "", self.store.settings.engine.use_engine_fit,
+                              [(d.name, d.total_mib, d.free_mib // 32) for d in devices],
+                              [(d.name, d.free_mib, d.margin_mib, round(d.mmproj_mib)) for d in pl.devices]],
+                             sort_keys=True)
         key = hashlib.sha1(key_src.encode()).hexdigest()
         cached = self._plan_cache.get(key)
-        if cached and time.time() - cached[0] < 120:
-            self._apply_projection(pl, cached[1], devices)
-            return
-        candidates = [pl.kv_k]
-        if p.kv_cache_type == "auto":
-            candidates = ["f16", "q8_0"] if p.flash_attn != "off" else ["f16"]
-        chosen: dict[str, Any] | None = None
-        for kv in candidates:
-            q = Plan(**{**pl.__dict__})
-            q.kv_k = q.kv_v = kv if p.kv_cache_type == "auto" else pl.kv_k
-            if p.kv_cache_type != "auto":
-                q.kv_v = pl.kv_v
-            if kv != "f16" and q.flash_attn == "auto":
-                q.flash_attn = "on"
-            q.use_engine_fit = True
-            args = build_fit_args(eng, entry.path, p, q, sel, margins, print_mode=False)
-            if not args:
-                return
-            rc, out = await asyncio.to_thread(_run_capture, args, 120)
-            fit = parse_fit_args(out)
-            if rc != 0 or not fit:
-                raise RuntimeError(f"llama-fit-params failed ({rc}): {out.strip().splitlines()[-1] if out.strip() else ''}")
-            ngl = fit.get("ngl", -1)
-            full = (ngl < 0 or ngl >= entry.info.n_layer) and "override_tensor" not in fit
-            chosen = {"kv_k": q.kv_k, "kv_v": q.kv_v, "flash_attn": q.flash_attn, "fit": fit, "full": full}
-            if full:
+        if cached and time.time() - cached[0] < PLAN_CACHE_S:
+            return copy.deepcopy(cached[1])
+
+        history: dict[str, list[tuple[int, float]]] = {}
+        fitting: dict[tuple[str, str], tuple[Plan, dict]] = {}  # per KV type: the largest measured plan that fits
+        last_fit: tuple[str, str] | None = None
+        measured = 0
+        cur = pl
+        # The estimate says the model does not fit in VRAM even at the smallest context: measure it there first.
+        # That measurement only calibrates the estimate, unless the planner then chooses exactly this layout.
+        probing = self._worth_measuring_full(entry, pl)
+        if probing:
+            cur = planner().full_offload_plan(pl.kv_k, min(pl.ctx_target, FIT_CTX_MIN))
+        proj: dict[str, dict[str, float]] = {}
+        bump: dict[str, float] = {}  # extra MiB to keep free where a calibrated layout still measured too large
+        last_measured: tuple[Plan, dict[str, dict[str, float]]] | None = None
+        while measured < MAX_PROJECTIONS and not cur.use_engine_fit:
+            proj = await self._project(eng, entry, p, cur, sel)
+            measured += 1
+            last_measured = (cur, proj)
+            self._record_calibration(cur, proj, history)
+            fits = self._projection_fits(cur, proj)
+            nxt = planner(self._calibration(history, bump)).plan()
+            same = nxt.layout_key() == cur.layout_key()
+            if same and not fits:
+                for d in cur.devices:
+                    over = self._measured_use(d, proj.get(d.name, {})) - (d.free_mib - d.margin_mib)
+                    if over > 0:
+                        bump[d.name] = bump.get(d.name, 0.0) + over + 8
+                nxt = planner(self._calibration(history, bump)).plan()
+                same = nxt.layout_key() == cur.layout_key()
+            if fits and (same or not probing):
+                chosen = nxt if same else cur  # same layout: take the plan with the latest calibration
+                kv = (chosen.kv_k, chosen.kv_v)
+                if kv not in fitting or chosen.ctx >= fitting[kv][0].ctx:
+                    fitting[kv] = (chosen, proj)
+                last_fit = kv
+            probing = False
+            if same:
                 break
-        if chosen is None:
-            return
-        q = Plan(**{**pl.__dict__})
-        q.kv_k, q.kv_v, q.flash_attn = chosen["kv_k"], chosen["kv_v"], chosen["flash_attn"]
-        fit = chosen["fit"]
+            cur = nxt
+
+        if last_fit is not None:
+            # every plan in `fitting` was measured; within the KV type chosen last, the largest context wins
+            final, proj = fitting[last_fit]
+            self._apply_projection(final, proj)
+        elif cur.use_engine_fit or last_measured is None:
+            final = await self._engine_fit_projection(eng, entry, p, cur, sel, devices)
+            measured += 2
+        else:
+            # nothing that was measured fits: the manual layout is larger than the free VRAM, or the engine needs
+            # more than estimated even at the smallest context
+            final, proj = last_measured
+            self._apply_projection(final, proj)
+            over = ", ".join(f"{d.name} by {self._measured_use(d, proj.get(d.name, {})) - (d.free_mib - d.margin_mib):,.0f} MiB"
+                             for d in final.devices
+                             if self._measured_use(d, proj.get(d.name, {})) > d.free_mib - d.margin_mib)
+            if final.mode == "auto" and eng.has("--fit", "-fit"):
+                final.use_engine_fit = True  # let llama.cpp place what does not fit
+                final.full_offload = False
+                final.load_mode = "mmap" if p.load_mode == "auto" else final.load_mode
+                final.warnings.append(f"Engine projection: the model does not fit in VRAM ({over}); llama.cpp will "
+                                      "keep the part that does not fit in system RAM.")
+            else:
+                final.warnings.append(f"Engine projection: this configuration exceeds the free VRAM ({over}); the "
+                                      "load may fail or spill into shared system memory (much slower).")
+        final.engine["measurements"] = measured
+        final.engine["calibration"] = {k: [round(a, 1), round(b, 5)]
+                                       for k, (a, b) in self._calibration(history, bump).items()}
+        self._plan_cache[key] = (time.time(), copy.deepcopy(final))
+        return final
+
+    @staticmethod
+    def _worth_measuring_full(entry: ModelEntry, pl: Plan) -> bool:
+        """The estimate puts part of the model in system RAM, but the model's weights alone would fit in VRAM."""
+        if pl.mode != "auto" or pl.full_offload or not pl.devices:
+            return False
+        weights = (entry.info.weights_bytes - entry.info.token_embd_bytes) / (1024 * 1024)
+        return weights < sum(d.free_mib - d.margin_mib for d in pl.devices)
+
+    async def _project(self, eng: EngineInfo, entry: ModelEntry, p: LoadParams, pl: Plan,
+                       sel: list[str]) -> dict[str, dict[str, float]]:
+        """llama-fit-params --fit-print for exactly the plan's layout: MiB of weights, context, compute per device."""
+        args = build_fit_args(eng, entry.path, p, pl, sel, [], print_mode=True)
+        if not args:
+            raise RuntimeError("llama-fit-params is not available")
+        rc, out = await asyncio.to_thread(_run_capture, args, FIT_TIMEOUT_S)
+        proj = parse_fit_print(out) if rc == 0 else {}
+        if not proj:
+            raise RuntimeError(f"llama-fit-params failed ({rc}): {out.strip().splitlines()[-1] if out.strip() else ''}")
+        return proj
+
+    @staticmethod
+    def _measured_use(d: DevicePlan, pr: dict[str, float]) -> float:
+        """What the device will hold: llama.cpp's projection plus what the projection does not include."""
+        return (pr.get("model", 0.0) + pr.get("context", 0.0) + pr.get("compute", 0.0) + PROJECTION_ROUNDING_MIB
+                + d.swa_extra_mib + d.scratch_mib + d.mmproj_mib + d.draft_mib)
+
+    def _projection_fits(self, pl: Plan, proj: dict[str, dict[str, float]]) -> bool:
+        return all(d.name in proj and self._measured_use(d, proj[d.name]) <= d.free_mib - d.margin_mib
+                   for d in pl.devices)
+
+    @staticmethod
+    def _record_calibration(pl: Plan, proj: dict[str, dict[str, float]], history: dict[str, list[tuple[int, float]]]) -> None:
+        """Difference between llama.cpp's projection and the estimate of the same buffers, per device."""
+        for d in pl.devices:
+            pr = proj.get(d.name)
+            if pr is None or not (d.layers or d.output_mib):
+                continue
+            estimate = d.weights_mib + d.output_mib + d.kv_mib - d.swa_extra_mib + d.compute_mib
+            # the same rounding allowance as _measured_use: a calibrated layout fits exactly when it measures so
+            engine = pr["model"] + pr["context"] + pr["compute"] + PROJECTION_ROUNDING_MIB
+            history.setdefault(d.name, []).append((pl.ctx, engine - estimate))
+
+    @staticmethod
+    def _calibration(history: dict[str, list[tuple[int, float]]],
+                     bump: dict[str, float] | None = None) -> dict[str, tuple[float, float]]:
+        """Per device (MiB, MiB per context token), from the latest measurements."""
+        out: dict[str, tuple[float, float]] = {}
+        for name, pts in history.items():
+            c2, e2 = pts[-1]
+            prev = next(((c, e) for c, e in reversed(pts[:-1]) if abs(c - c2) >= CALIB_MIN_SPAN), None)
+            if prev is None:
+                a, b = e2, 0.0
+            else:
+                b = (e2 - prev[1]) / (c2 - prev[0])
+                a = e2 - b * c2
+            out[name] = (a + (bump or {}).get(name, 0.0), b)
+        return out
+
+    async def _engine_fit_projection(self, eng: EngineInfo, entry: ModelEntry, p: LoadParams, pl: Plan,
+                                     sel: list[str], devices: list[EngineDevice]) -> Plan:
+        """Layout llama.cpp's --fit chooses for a plan that does not fit in VRAM (measured for display)."""
+        n_layer = entry.info.n_layer
+        args = build_fit_args(eng, entry.path, p, pl, sel, self._fit_targets(devices, p, pl, projection=True),
+                              print_mode=False)
+        if not args:
+            return pl
+        rc, out = await asyncio.to_thread(_run_capture, args, FIT_TIMEOUT_S)
+        fit = parse_fit_args(out)
+        if rc != 0 or not fit:
+            raise RuntimeError(f"llama-fit-params failed ({rc}): {out.strip().splitlines()[-1] if out.strip() else ''}")
         ngl = fit.get("ngl", -1)
-        q.gpu_layers = entry.info.n_layer + 1 if ngl < 0 else ngl
+        # every layer and the output layer (MTP layers are not loaded for decoding)
+        full = (ngl < 0 or ngl > n_layer - entry.info.nextn_layers) and "override_tensor" not in fit
+        q = copy.deepcopy(pl)
+        q.gpu_layers = n_layer + 1 if ngl < 0 else min(ngl, n_layer + 1)
         q.tensor_split = fit.get("tensor_split") or pl.tensor_split
         q.n_cpu_moe = 0
         q.use_engine_fit = False
-        pargs = build_fit_args(eng, entry.path, p, q, sel, margins, print_mode=True)
+        pargs = build_fit_args(eng, entry.path, p, q, sel, [], print_mode=True)
         if fit.get("override_tensor") and pargs:
             pargs += ["-ot", fit["override_tensor"]]
         proj: dict[str, Any] = {}
         if pargs:
-            rc, out = await asyncio.to_thread(_run_capture, pargs, 120)
+            rc, out = await asyncio.to_thread(_run_capture, pargs, FIT_TIMEOUT_S)
             if rc == 0:
                 proj = parse_fit_print(out)
-        chosen["projection"] = proj
-        self._plan_cache[key] = (time.time(), chosen)
-        self._apply_projection(pl, chosen, devices)
+        pl.gpu_layers = q.gpu_layers
+        pl.tensor_split = q.tensor_split if len(pl.devices) > 1 else None
+        if "override_tensor" not in fit:
+            pl.n_cpu_moe = 0  # otherwise keep the estimate's expert count for the layer map
+        pl.full_offload = full
+        if len(pl.devices) and pl.gpu_layers:
+            assign = assign_layers(n_layer, pl.gpu_layers, pl.tensor_split or [1.0] * len(pl.devices))
+            for i, d in enumerate(pl.devices):
+                own = [il for il in range(n_layer) if assign[il] == i]
+                d.layers = len(own)
+                d.layer_first, d.layer_last = (own[0], own[-1]) if own else (-1, -1)
+        self._apply_projection(pl, proj)
+        pl.engine["fit"] = fit
+        pl.notes = [n for n in pl.notes if not n.startswith(("Partial offload:", "MoE offload:"))]
+        if full:
+            pl.notes.append("Engine projection: the whole model fits in VRAM at this context.")
+        else:
+            ot = fit.get("override_tensor")
+            pl.notes.append("Engine projection: llama.cpp keeps " + (
+                "some expert or feed-forward weights in system RAM" if ot else
+                f"{n_layer + 1 - q.gpu_layers} of {n_layer + 1} layers in system RAM") +
+                " (prompt processing and generation will be much slower).")
+        if p.load_mode == "auto":
+            pl.load_mode = "none" if full else "mmap"
+        return pl
 
     @staticmethod
-    def _apply_projection(pl: Plan, chosen: dict[str, Any], devices: list[EngineDevice]) -> None:
-        was_kv = pl.kv_k
-        pl.kv_k, pl.kv_v = chosen["kv_k"], chosen["kv_v"]
-        pl.flash_attn = chosen["flash_attn"]
-        pl.full_offload = bool(chosen["full"])
-        pl.source = "engine"
-        proj = chosen.get("projection") or {}
-        pl.engine = {"fit": chosen["fit"], "projection": proj, "full_offload": chosen["full"]}
-        if was_kv != pl.kv_k:
-            pl.notes = [n for n in pl.notes if "KV cache set to" not in n]
-            if pl.kv_k != "f16":
-                pl.notes.append("Engine projection: KV cache Q8_0 needed for a full GPU offload.")
-            else:
-                pl.notes.append("Engine projection: full F16 KV cache fits in VRAM.")
+    def _apply_projection(pl: Plan, proj: dict[str, dict[str, float]]) -> None:
+        """Show llama.cpp's measured buffers instead of the estimate."""
         for d in pl.devices:
             pr = proj.get(d.name)
             if pr:
                 d.weights_mib = pr["model"]
-                d.kv_mib = pr["context"]
-                d.compute_mib = pr["compute"]
                 d.output_mib = 0.0
-                d.draft_mib = 0.0
+                d.kv_mib = pr["context"] + d.swa_extra_mib
+                d.compute_mib = pr["compute"]
+                d.calib_mib = 0.0
         if "Host" in proj:
             pl.host = {"weights_mib": proj["Host"]["model"], "kv_mib": proj["Host"]["context"],
                        "compute_mib": proj["Host"]["compute"]}
         pl.totals["vram_used_mib"] = round(sum(d.used_mib for d in pl.devices), 1)
-        if not chosen["full"]:
-            ot = chosen["fit"].get("override_tensor")
-            pl.warnings.append(
-                "Engine projection: the model does not fully fit in VRAM at this context; "
-                + ("some expert weights will be kept in system RAM." if ot else
-                   f"{chosen['fit'].get('ngl')} layers will be offloaded to the GPU(s).")
-            )
+        pl.source = "engine"
+        pl.engine = {**pl.engine, "projection": proj, "full_offload": pl.full_offload}
 
     def _template_file(self, entry: ModelEntry, p: LoadParams) -> str | None:
         if p.chat_template_mode != "custom" or not p.chat_template_custom.strip():
@@ -389,10 +548,8 @@ class ModelManager:
             sel = [d.name for d in devices if not p.devices or d.name in p.devices]
             mmproj = pl.mmproj or None
             draft = self._draft_for(p)
-            if pl.source == "engine":
-                self.bus.activity_log(
-                    f"Engine projection: {'full GPU offload' if pl.full_offload else 'partial offload'}, "
-                    f"KV {pl.kv_k.upper()}, context {pl.ctx:,}", category="model")
+            self.bus.activity_log(_placement_summary(pl), category="model", model=entry.id,
+                                  level="ok" if pl.full_offload or not pl.devices else "warn")
             if self._shutting_down:  # planning can take a while; never start an engine during shutdown
                 raise ModelError("WinRunner is shutting down", 503, "shutting_down")
             port = free_port()
@@ -400,7 +557,7 @@ class ModelManager:
             spec = build_server_args(
                 eng, entry.path, p, pl, sel, port, entry.id, api_key, mmproj, draft.path if draft else None,
                 self._template_file(entry, p), entry.info.kind == "embedding",
-                self.store.settings.engine.log_verbosity, self._margins(devices, p),
+                self.store.settings.engine.log_verbosity, self._fit_targets(devices, p, pl),
             )
             prof = self.store.profile(entry.path)
             inst = EngineInstance(
@@ -803,6 +960,29 @@ class ModelManager:
     def status(self) -> dict[str, Any]:
         return {"instances": [i.status() for i in self.instances.values()],
                 "pending": list(self._pending.keys())}
+
+
+def _placement_summary(pl: Plan) -> str:
+    """One line for the activity log: where the model goes, the context and the planned VRAM per GPU."""
+    if not pl.devices:
+        return f"Placement: CPU only, context {pl.ctx:,}"
+    if pl.full_offload:
+        where = "whole model in VRAM"
+    elif pl.n_cpu_moe:
+        where = f"expert weights of {pl.n_cpu_moe} layers in system RAM"
+    elif pl.use_engine_fit:
+        where = "part of the model in system RAM (placed by llama.cpp)"
+    else:
+        where = f"{pl.n_layer + 1 - pl.gpu_layers} of {pl.n_layer + 1} layers in system RAM"
+    ctx = f"context {pl.ctx:,}"
+    if pl.ctx_adjusted == "raised":
+        ctx += f" (raised from {pl.ctx_target:,} to fill VRAM)"
+    elif pl.ctx_adjusted == "reduced":
+        ctx += f" (reduced from {pl.ctx_target:,} to keep the model in VRAM)"
+    vram = ", ".join(f"{d.name} {(d.total_mib - d.free_mib + d.used_mib) / 1024:.1f}/{d.total_mib / 1024:.1f} GiB"
+                     for d in pl.devices)
+    src = "measured by the engine" if pl.source == "engine" else "estimate"
+    return f"Placement ({src}): {where}, KV {pl.kv_k.upper()}, {ctx}; VRAM {vram}"
 
 
 def _run_capture(args: list[str], timeout: float) -> tuple[int, str]:

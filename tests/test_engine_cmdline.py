@@ -112,24 +112,48 @@ def _plan(p: LoadParams, fit: bool):
     return Planner(m, p, devs, engine_fit=fit).plan(), [d.name for d in devs]
 
 
-def test_server_args_new_engine_auto_fit():
+def test_server_args_new_engine_full_offload():
     eng = engine_from_help(HELP_NEW)
-    p = LoadParams(context_length=16384)
+    p = LoadParams(context_length=16384, context_fit="fit")
     pl, names = _plan(p, True)
     spec = build_server_args(eng, "/m/model.gguf", p, pl, names, 5100, "my-model", "secret", "/m/mmproj.gguf", None, None,
-                             False, 4, [1024, 1024])
+                             False, 4, [256, 256])
     a = spec.args
     assert a[:3] == ["/e/llama-server", "-m", "/m/model.gguf"]
     assert ["--alias", "my-model"] == a[a.index("--alias"):a.index("--alias") + 2]
     assert a[a.index("-c") + 1] == "16384"
     assert a[a.index("-fa") + 1] in ("auto", "on")
-    assert "--fit" in a and a[a.index("--fit") + 1] == "on"
-    assert a[a.index("--fit-target") + 1] == "1024,1024"
-    assert "-ngl" not in a  # the engine fits layers itself
+    # the whole model fits: the verified layout is passed and llama.cpp's --fit must not move layers to the CPU
+    assert a[a.index("-ngl") + 1] == "all"
+    assert "-ts" in a and sum(int(x) for x in a[a.index("-ts") + 1].split(",")) == 29
+    assert a[a.index("--fit") + 1] == "off" and "--fit-target" not in a
     assert a[a.index("--load-mode") + 1] == "none"
     assert "--mmproj" in a and "--jinja" in a and "--no-ui" in a and "--log-jsonl" in a
     assert "--chat-template" not in a  # GGUF template is used
     assert "--temp" not in a and "--top-k" not in a  # GGUF sampling defaults are not overridden
+
+
+def test_server_args_fill_context():
+    eng = engine_from_help(HELP_NEW)
+    p = LoadParams(context_length=16384)  # context_fit "fill" (default): the small model's KV cache fills the GPUs
+    pl, names = _plan(p, True)
+    a = build_server_args(eng, "/m/model.gguf", p, pl, names, 5100, "m", "", None, None, None, False, 4, [256, 256]).args
+    assert a[a.index("-c") + 1] == "40960"  # up to the trained context
+
+
+def test_server_args_model_larger_than_vram_uses_engine_fit():
+    eng = engine_from_help(HELP_NEW)
+    devs = [EngineDevice("Vulkan0", "RX 6800", 16368, 15300), EngineDevice("Vulkan1", "RX 6800", 16368, 16100)]
+    big = fake_model(n_layer=64, layer_mib=700, ctx_train=131072)
+    p = LoadParams(context_length=32768, kv_cache_type="q8_0")
+    pl = Planner(big, p, devs, engine_fit=True).plan()
+    assert not pl.full_offload and pl.use_engine_fit
+    targets = [256 + int(d.scratch_mib + 1) for d in pl.devices]
+    a = build_server_args(eng, "/m/big.gguf", p, pl, [d.name for d in devs], 1, "m", "", None, None, None, False, 4,
+                          targets).args
+    assert "-ngl" not in a and a[a.index("--fit") + 1] == "on"
+    assert a[a.index("--fit-target") + 1] == ",".join(map(str, targets))
+    assert all(t > 256 + 100 for t in targets)  # flash attention's F16 copy of the Q8_0 cache is kept free as well
 
 
 def test_server_args_old_engine_explicit_plan():
@@ -163,12 +187,15 @@ def test_template_override_and_extra_args():
 
 def test_fit_and_bench_args():
     eng = engine_from_help(HELP_NEW, fit_params="/e/llama-fit-params", bench="/e/llama-bench")
-    p = LoadParams(context_length=8192)
+    p = LoadParams(context_length=8192, parallel=4, threads=6)
     pl, names = _plan(p, True)
     fa = build_fit_args(eng, "/m/x.gguf", p, pl, names, [1024, 1024], print_mode=False)
-    assert fa[0] == "/e/llama-fit-params" and "--fit-target" in fa and "-ngl" not in fa
-    fp = build_fit_args(eng, "/m/x.gguf", p, pl, names, [1024, 1024], print_mode=True)
-    assert fp[-2:] == ["--fit-print", "on"] and "-ngl" in fp
+    assert fa[0] == "/e/llama-fit-params" and fa[fa.index("--fit-target") + 1] == "1024,1024" and "-ngl" not in fa
+    fp = build_fit_args(eng, "/m/x.gguf", p, pl, names, [], print_mode=True)
+    assert fp[-2:] == ["--fit-print", "on"] and fp[fp.index("-ngl") + 1] == "all" and "-ts" in fp
+    for args in (fa, fp):
+        # without --kv-unified (a server option) -np would measure a separate KV cache per slot
+        assert "-np" not in args and "-t" not in args and "--load-mode" not in args
     b = build_bench_args(eng, "/m/x.gguf", p, pl, names, "512", "128", "0", 3)
     assert b[0] == "/e/llama-bench" and "-o" in b and b[b.index("-o") + 1] == "json"
     assert "/" in b[b.index("-ts") + 1]  # llama-bench uses '/' separators
