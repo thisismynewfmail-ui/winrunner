@@ -112,3 +112,46 @@ def test_hardware_monitor_uses_sysfs(fake_sys, monkeypatch):
     assert m == {"Vulkan0": "gpu0", "Vulkan1": "gpu1"}
     info = mon.system_info()
     assert info["gpus"][0]["rebar"] is True and "sysfs" not in info["gpus"][0]
+
+
+def test_port_check_allows_restart_while_old_sockets_wait():
+    import socket
+
+    from winrunner.util import port_available
+
+    ls = socket.socket()
+    ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("127.0.0.1", 0))
+    ls.listen()
+    port = ls.getsockname()[1]
+    assert not port_available(port, "127.0.0.1")  # another program listens
+    c = socket.create_connection(("127.0.0.1", port))
+    a, _ = ls.accept()
+    a.close()  # server side closes first: TIME_WAIT on the server port
+    c.close()
+    ls.close()
+    assert port_available(port, "127.0.0.1")
+
+
+def test_window_icon_prefers_a_readable_png():
+    from winrunner.__main__ import _window_icon
+
+    assert _window_icon(None) is None and _window_icon("edgechromium") is None
+    assert _window_icon("qt").endswith("icon.png")
+
+
+def test_linux_recommendations_for_two_rx6800():
+    from winrunner.app import recommendations
+
+    G = 1 << 30
+    gpu = lambda i, pcie, bar: {"id": f"gpu{i}", "name": "Radeon RX 6800", "vendor": "AMD", "vram_total": 16 * G,
+                                "pcie": pcie, "rebar": bar, "pci": f"0000:0{i}:00.0"}
+    recs = recommendations({"cpu": "AMD Ryzen 5 3600 6-Core Processor", "cores_physical": 6, "cores_logical": 12,
+                            "ram_total": 64 * G, "vulkan_driver": "25.0.7",
+                            "render_access": {"nodes": ["/dev/dri/renderD128"], "accessible": []},
+                            "gpus": [gpu(0, "PCIe 4.0 x16", True), gpu(1, "PCIe 4.0 x4 (card supports x16)", False)]})
+    titles = [r["title"] for r in recs]
+    for t in ("Backend", "PCIe slots", "Resizable BAR", "GPU access", "Multi-GPU layer split"):
+        assert t in titles
+    assert "RADV" in next(r["text"] for r in recs if r["title"] == "Backend")
+    assert not any("TDR" in t for t in titles)

@@ -18,6 +18,7 @@ from . import PRODUCT_NAME, PRODUCT_TAGLINE, __version__
 from .cmdline import build_bench_args
 from .config import SAMPLING_KEYS, LoadParams
 from .context import AppContext
+from .hardware import recommended_threads
 from .manager import ModelError
 from .templates import TemplateError, analyze, render
 from .util import lan_addresses
@@ -496,7 +497,8 @@ def build_router(ctx: AppContext) -> APIRouter:
         devices, _ = await ctx.manager.devices(max_age=5)
         sel = [d.name for d in devices if not p.devices or d.name in p.devices]
         args = build_bench_args(eng, e.path, p, pl, sel, str(body.get("pp", "512")), str(body.get("tg", "128")),
-                                str(body.get("depth", "0")), int(body.get("reps", 3)))
+                                str(body.get("depth", "0")), int(body.get("reps", 3)),
+                                threads=recommended_threads()[0])
         if not args:
             return _err(400, "could not build benchmark command")
         if body.get("unload") and ctx.manager.instances:

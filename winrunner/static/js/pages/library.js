@@ -619,7 +619,7 @@ export function openDownloads(query = '') {
 // ------------------------------------------------------------------------------------
 export async function openFolders() {
   const list = h('div', { class: 'col' });
-  const path = input('', null, { placeholder: 'C:\\Models or D:\\LLM\\gguf', cls: 'grow mono' });
+  const path = input('', null, { placeholder: store.status?.platform === 'win32' ? 'C:\\Models or D:\\LLM\\gguf' : '/home/you/models or /mnt/data/gguf', cls: 'grow mono' });
   const body = h('div', { class: 'col' }, h('p', { class: 'dim' }, 'Folders are scanned recursively for .gguf files. LM Studio\'s model folder layout (publisher/repository/file.gguf) is supported.'),
     list, h('div', { class: 'row' }, path, btn('Add folder', async () => {
       try { await api.post(wr('/library/folder'), { path: path.value.trim(), action: 'add' }); path.value = ''; await render(); } catch (e) { toast(e.message, 'err'); }

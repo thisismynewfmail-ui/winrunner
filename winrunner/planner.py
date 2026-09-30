@@ -959,10 +959,10 @@ class Planner:
                 "memory minus the safety margin.")
         elif strategy == "layers":
             more = f", and feed-forward weights of {n_ram} more layer(s) are in system RAM" if n_ram else ""
+            hint = "A shorter context" if k in QUANTIZED_KV else "A Q8_0 KV cache or a shorter context"
             notes.append(
                 f"The attention part of all layers does not fit at this context: the first {lay.k_cpu} of {n_layer} "
-                f"layers run on the CPU (with their KV cache){more}. A Q8_0 KV cache or a shorter context keeps "
-                "more on the GPUs.")
+                f"layers run on the CPU (with their KV cache){more}. {hint} would keep more on the GPUs.")
         if fa == "auto" and (k in QUANTIZED_KV or v in QUANTIZED_KV):
             fa = "on"
         if manual and devs and not self._fits(devs):
