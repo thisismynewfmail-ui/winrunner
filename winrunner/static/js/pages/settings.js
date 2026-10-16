@@ -248,6 +248,10 @@ export function mount(root) {
     const f = h('div', { class: 'form' });
     formRow(f, 'VRAM safety margin', h('div', { class: 'row' }, input(hw.vram_margin_mib, (v) => save({ hardware: { vram_margin_mib: Number(v) } }), { type: 'number', cls: 'num', min: 0, step: 128 }),
       h('span', { class: 'dim' }, 'MiB per GPU')), 'Left free on every GPU after the model is loaded (default 512 MiB: a 16 GB card ends at about 15.5 GiB used). Per-device values can be set in the table above.');
+    if (isWin()) {
+      formRow(f, 'Physical VRAM', toggle('Use all physical VRAM (recommended)', hw.use_physical_vram !== false, (v) => save({ hardware: { use_physical_vram: v } }, 'Saved - applies to the next load')),
+        'Windows tells Vulkan programs only its per-process budget, about 0.7-1.2 GB less than the free VRAM Task Manager shows. On: GPUs are filled to the physical free VRAM minus the margin. If Windows ever moves model memory to system RAM, WinRunner warns and leaves more room at the next load.');
+    }
     formRow(f, 'Telemetry interval', select([[0.5, '0.5 s'], [1, '1 s'], [2, '2 s'], [5, '5 s']], hw.telemetry_interval_s, (v) => save({ hardware: { telemetry_interval_s: Number(v) } })));
     host.append(
       group('System', kv([['Operating system', sys.os], ['Processor', `${sys.cpu} · ${sys.cores_physical} cores / ${sys.cores_logical} threads`],

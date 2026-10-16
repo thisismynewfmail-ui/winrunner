@@ -388,7 +388,13 @@ Logs: **Logs** tab, or `data/logs/winrunner.log`.
 WinRunner still runs on Windows 10/11: double-click `install.bat` (conda environment, Vulkan engine), then start
 `WinRunner.bat`. `scripts\firewall.bat` opens the port, and `scripts\gpu-timeout.bat` raises the Windows GPU
 timeout (TDR) from 2 to 60 seconds, which long prompts on large models can otherwise exceed ("ErrorDeviceLost").
-The GPU-first allocation works the same way; Windows may limit each GPU to a little less than its full VRAM.
+The GPU-first allocation works the same way. On Windows the Vulkan driver reports only the video memory *budget*
+Windows grants each process, about 0.7–1.2 GB less than the free VRAM Task Manager shows; planning with that figure
+stopped the GPUs at ~14.4–14.8 GB. WinRunner therefore plans with the physical free VRAM from the GPU performance
+counters (total minus the dedicated memory of all processes), so each 16 GB card is filled to about 15.5 GB with the
+512 MiB margin (*Settings › Hardware › Use all physical VRAM*, on by default). After every load it checks with the
+same counters that the engine's buffers really are in VRAM; if Windows moved some of them to shared system memory
+(slow), the activity log says so and the next load leaves that much more room on that GPU.
 
 ## Development
 

@@ -9,7 +9,7 @@ import logging
 import os
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -81,6 +81,8 @@ class ModelManager:
         self._recoveries: dict[str, _Recovery] = {}  # model id -> running recovery
         self._recovery_log: dict[str, list[float]] = {}  # model id -> times of automatic restarts
         self._background: set[asyncio.Task] = set()
+        self._device_pci: dict[str, str] = {}  # engine device -> PCI address, from the engine's load log
+        self._vram_penalty: dict[str, int] = {}  # MiB the OS did not keep resident at the last load, per device
         self._substitutes: set[tuple[str, str]] = set()  # (requested name, model answering) already reported
         self._tdr_hint_shown = False
         self._measure_cache: dict[str, tuple[float, dict]] = {}
@@ -111,7 +113,71 @@ class ModelManager:
 
     def device_map(self, devices: list[EngineDevice]) -> dict[str, str]:
         return self.monitor.map_engine_devices([{"name": d.name, "description": d.description,
-                                                 "total_mib": d.total_mib, "free_mib": d.free_mib} for d in devices])
+                                                 "total_mib": d.total_mib, "free_mib": d.free_mib,
+                                                 "pci": self._device_pci.get(d.name)} for d in devices])
+
+    async def _physical_vram(self, devices: list[EngineDevice], fresh: bool) -> tuple[list[EngineDevice], dict[str, int]]:
+        """Windows: free VRAM of each GPU as the hardware has it, not as the Vulkan driver reports it.
+
+        On Windows the driver reports free memory = the per-process budget Windows grants (WDDM) minus usage. That
+        budget keeps roughly 0.7-1.2 GB of a 16 GB card unused, so a plan based on it stops at ~14.5 GB. The GPU
+        performance counters (Task Manager's dedicated memory) give the memory that no process uses. Returns the
+        adjusted devices and the MiB gained per device.
+        """
+        if not (IS_WINDOWS and self.store.settings.hardware.use_physical_vram and devices):
+            return devices, {}
+        sample = await asyncio.to_thread(self.monitor.wait_sample, time.time()) if fresh else self.monitor.last
+        phys = self.monitor.physical_free_mib(sample)
+        if not phys:
+            return devices, {}
+        dmap = self.device_map(devices)
+        out, gained = [], {}
+        for d in devices:
+            pf = phys.get(dmap.get(d.name, ""))
+            if pf is not None:
+                pf -= self._vram_penalty.get(d.name, 0)
+            if pf is not None and d.free_mib + 64 < pf <= d.total_mib:
+                gained[d.name] = int(pf) - d.free_mib
+                d = replace(d, free_mib=int(pf))
+            out.append(d)
+        return out, gained
+
+    def _check_residency(self, inst: EngineInstance) -> None:
+        """After a load: warn if the OS keeps part of the engine's GPU buffers in system memory (very slow)."""
+        async def check() -> None:
+            vram: dict[str, float] = {}
+            for _ in range(12):  # the GPU counters list a new process within ~30 s
+                await asyncio.sleep(4.0)
+                if inst.state != "ready" or not inst.pid:
+                    return
+                sample = await asyncio.to_thread(self.monitor.wait_sample, time.time())
+                vram = (sample.get("procs", {}).get(str(inst.pid)) or {}).get("vram") or {}
+                if vram:
+                    break
+            if not vram:
+                return
+            dmap = inst.device_map or {}
+            for name, bufs in (inst.load_info.get("buffers") or {}).items():
+                gid = dmap.get(name)
+                if gid not in vram:
+                    continue
+                expected = sum(float(v) for v in bufs.values())
+                resident = float(vram[gid]) / (1024 * 1024)
+                if expected - resident > 512:
+                    if IS_WINDOWS and self.store.settings.hardware.use_physical_vram:
+                        missing = int(expected - resident) + 256
+                        self._vram_penalty[name] = max(self._vram_penalty.get(name, 0), missing)
+                        hint = (f" The next load of a model leaves {missing:,} MiB more free on {name}; reload the "
+                                "model to apply it.")
+                    else:
+                        hint = " Raise the safety margin for this GPU (Settings > Hardware)."
+                    self.bus.activity_log(
+                        f"{inst.model_id}: only {resident:,.0f} of {expected:,.0f} MiB of the engine's buffers are "
+                        f"in {name}'s VRAM; the rest was moved to system memory, which makes the model slow.{hint}",
+                        level="warn", category="model", model=inst.model_id)
+                    log.warning("%s: %s holds %.0f of %.0f MiB in VRAM", inst.model_id, name, resident, expected)
+
+        self._spawn(check())
 
     # ----- lifecycle helpers ------------------------------------------------------------
 
@@ -187,6 +253,7 @@ class ModelManager:
         eng = await self.engine_async()
         p = self.store.effective_load_params(entry.path, overrides)
         devices, dev_err = await self.devices(max_age=0 if fresh_devices else 3.0)
+        devices, vram_gained = await self._physical_vram(devices, fresh_devices)
         evicting = self._evict_set(entry.id) if assume_evict else []
         mmproj = self._mmproj_for(entry, p)
         mm_size = 0
@@ -247,6 +314,11 @@ class ModelManager:
         pl.draft = draft.path if draft else ""
         if evicting:
             pl.notes.append(f"Planned for the free VRAM after {', '.join(i.model_id for i in evicting)} is unloaded.")
+        if vram_gained:
+            pl.notes.append(
+                "Planned with the physical free VRAM (as Task Manager shows it): Windows reports "
+                + ", ".join(f"{n} {v:,} MiB" for n, v in sorted(vram_gained.items()))
+                + " less to Vulkan (its per-process budget).")
         if verify and not can_measure and eng and not eng.fit_params:
             pl.notes.append("This engine build does not include llama-fit-params; the plan is an estimate.")
         if mmproj and p.mmproj_offload and not mm_hint:
@@ -442,6 +514,8 @@ class ModelManager:
                 raise ModelError(str(exc), 500, "load_failed") from exc
             if inst.pid:
                 self.monitor.watch_process(inst.pid, inst.model_id)
+                self._check_residency(inst)
+            self._device_pci.update(inst.load_info.get("device_pci") or {})
             prof = self.store.profile(entry.path)
             prof.last_loaded = time.time()
             prof.load_count += 1
